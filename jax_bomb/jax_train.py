@@ -8,6 +8,7 @@ obs7/logits/masks）KL 蒸馏，可接 --distill-then-ppo 继续自对弈 PPO。
 
 import argparse
 import glob
+import json
 import os
 import pickle
 import time
@@ -18,9 +19,18 @@ import jax.random as jrandom
 import numpy as np
 import optax
 
-from .jax_env import (H, W, MAX_HP, MAX_STEPS, N_BOMB, N_MOVES, N_OBS_CH,
-                      _danger_map, global_vec, init_batch, legal_mask,
-                      make_obs, step)
+RULE_NAME = os.environ.get("JAXBOMB_RULE", "battle")
+IS_BUN = RULE_NAME == "bun"
+if IS_BUN:
+    from .bun_env import (H, W, MAX_HP, MAX_STEPS, N_BOMB, N_MOVES,
+                          N_OBS_CH, _danger_map, global_vec, init_batch,
+                          legal_mask, make_obs, prepare as prepare_environment,
+                          reward_from_events as _bun_reward_from_events, step)
+else:
+    from .jax_env import (H, W, MAX_HP, MAX_STEPS, N_BOMB, N_MOVES,
+                          N_OBS_CH, _danger_map, global_vec, init_batch,
+                          legal_mask, make_obs, step)
+    _bun_reward_from_events = None
 from .jax_net import (BIN_CENTERS, NUM_VALUE_BINS, V_MAX, V_MIN,
                       count_params, init_net, net_forward)
 from .platform import device_summary, setup_platform
@@ -94,8 +104,18 @@ def reward_from_events(dmg, alive_before, alive_after, hp_after, done,
                        double_death_penalty=DOUBLE_DEATH_PENALTY,
                        win_hp_bonus=WIN_HP_BONUS,
                        trade_win_bonus=TRADE_WIN_BONUS,
-                       moves=None, bombs=None, idle_penalty=0.015):
+                       moves=None, bombs=None, idle_penalty=0.015,
+                       rule_info=None):
     """Compute JAX PPO rewards from post-step events without reset-state leakage."""
+    if IS_BUN:
+        return _bun_reward_from_events(
+            dmg, alive_before, alive_after, hp_after, done,
+            crate_grew, newly, walls_destroyed, crate_coef, explore_coef,
+            brick_coef, timeout_alpha, win_bonus, lose_bonus,
+            timeout_lead_bonus, timeout_trail_penalty, timeout_draw_bonus,
+            mutual_hit_penalty, double_death_penalty, win_hp_bonus,
+            trade_win_bonus, moves=moves, bombs=bombs,
+            idle_penalty=idle_penalty, rule_info=rule_info)
     dmg = dmg.astype(jnp.float32)
     dealt = dmg.sum(axis=-1, keepdims=True) - dmg
     rew = ((dealt - dmg) * HIT_REWARD
@@ -404,11 +424,13 @@ def collect_rollout(params, arch, states, key, num_steps, no_mask=False,
             timeout_lead_bonus, timeout_trail_penalty, timeout_draw_bonus,
             mutual_hit_penalty, double_death_penalty, win_hp_bonus,
             trade_win_bonus,
-            moves=env_acts[:, :, 0], bombs=env_acts[:, :, 1], idle_penalty=idle_penalty)
+            moves=env_acts[:, :, 0], bombs=env_acts[:, :, 1],
+            idle_penalty=idle_penalty, rule_info=info)
         nov = nov + newly.astype(jnp.float32)       # 统计用：探索分/帧可监控
         n_alive = info["alive"].sum(axis=-1)          # (N,)
         death_done = done & (n_alive == 1)
-        kills = kills + death_done.astype(jnp.float32)   # 击杀局数（动态退火 x）
+        kill_event = info["death"].any(axis=-1) if IS_BUN else death_done
+        kills = kills + kill_event.astype(jnp.float32)
 
         if action_repeat == 2:
             key, kstep2, k_bot1_2, k_bot0_2 = jrandom.split(key, 4)
@@ -442,7 +464,8 @@ def collect_rollout(params, arch, states, key, num_steps, no_mask=False,
                 timeout_lead_bonus, timeout_trail_penalty, timeout_draw_bonus,
                 mutual_hit_penalty, double_death_penalty, win_hp_bonus,
                 trade_win_bonus,
-                moves=env_acts2[:, :, 0], bombs=env_acts2[:, :, 1], idle_penalty=idle_penalty)
+                moves=env_acts2[:, :, 0], bombs=env_acts2[:, :, 1],
+                idle_penalty=idle_penalty, rule_info=info2)
             rew = rew + jnp.where(done[:, None], 0.0, rew2)
             nov = nov + jnp.where(done[:, None], 0.0, newly2.astype(jnp.float32))
             n_alive2 = info2["alive"].sum(axis=-1)
@@ -499,15 +522,19 @@ def collect_rollout_two(params_a, params_b, arch, states, key, num_steps,
         new_states, done, info = jax.vmap(
             lambda s, a, kk: step(s, a, kk, return_info=True))(states, env_acts,
                                                                keys)
-        # 胜率计数（与 collect_rollout 的 win/lose 奖励同口径）
-        n_alive = info["alive"].sum(axis=-1)
-        death_done = done & (n_alive == 1)
-        p0_win = death_done & info["alive"][:, 0]
-        p0_lose = death_done & ~info["alive"][:, 0]
-        all_alive = done & (n_alive == 2)
-        hp_f = info["hp"]
-        p0_win = p0_win | (all_alive & (hp_f[:, 0] > hp_f[:, 1]))
-        p0_lose = p0_lose | (all_alive & (hp_f[:, 0] < hp_f[:, 1]))
+        # 胜率计数（与当前规则终局口径一致）
+        if IS_BUN:
+            p0_win = done & (info["winner"] == 0)
+            p0_lose = done & (info["winner"] == 1)
+        else:
+            n_alive = info["alive"].sum(axis=-1)
+            death_done = done & (n_alive == 1)
+            p0_win = death_done & info["alive"][:, 0]
+            p0_lose = death_done & ~info["alive"][:, 0]
+            all_alive = done & (n_alive == 2)
+            hp_f = info["hp"]
+            p0_win = p0_win | (all_alive & (hp_f[:, 0] > hp_f[:, 1]))
+            p0_lose = p0_lose | (all_alive & (hp_f[:, 0] < hp_f[:, 1]))
         return (new_states, key), (p0_win.sum(), p0_lose.sum())
 
     (final_states, _), (w, l) = jax.lax.scan(
@@ -999,6 +1026,26 @@ def save_params(params, path: str) -> None:
     print(f"params 已保存 -> {path}", flush=True)
 
 
+def save_run_metadata(path: str, args) -> None:
+    if not IS_BUN:
+        return
+    metadata_path = f"{os.path.splitext(path)[0]}.json"
+    metadata = {
+        "rule": "bun",
+        "qqt_map_id": 806,
+        "observation_channels": N_OBS_CH,
+        "move_actions": N_MOVES,
+        "ability_actions": N_BOMB,
+        "ability_encoding": {"0": "none", "1": "bomb", "2": "use_item"},
+        "max_steps": MAX_STEPS,
+        "architecture": args.arch,
+        "embed": args.embed,
+        "depth": args.depth,
+    }
+    with open(metadata_path, "w", encoding="utf-8") as file:
+        json.dump(metadata, file, ensure_ascii=False, indent=2)
+
+
 def load_params(path: str):
     """从 pickle 加载 params 并放到设备（用于蒸馏初始权重 / PPO 续跑）。"""
     with open(path, "rb") as f:
@@ -1032,7 +1079,8 @@ def build_one_iter(params, opt, opt_state, states, key, args):
             params, args.arch, states, key, steps,
             getattr(args, "no_mask", False),
             getattr(args, "obs_quant", False),
-            getattr(args, "checkpoint", False))
+            getattr(args, "checkpoint", False),
+            flee_bot_ratio=getattr(args, "flee_bot_ratio", 0.0))
         obs, state, acts, lps, vals, rew, done, masks = batch
         # bootstrap：rollout 尾部状态价值（全局状态向量同步传入）
         fobs = both_perspectives(states)
@@ -1148,6 +1196,13 @@ def main():
     ap.add_argument("--clip-eps", type=float, default=0.2)
     ap.add_argument("--vf-coef", type=float, default=0.5)
     ap.add_argument("--ent-coef", type=float, default=0.01)
+    ap.add_argument("--levels", default=None,
+                    help="关卡 JSON；bun_train 默认使用 web/assets/maps/levels.json 并强制地图 806")
+    ap.add_argument("--level-weights", default="",
+                    help="普通模式关卡权重；bun_train 忽略并只训练地图 806")
+    ap.add_argument("--flee-bot-ratio", type=float,
+                    default=0.0 if IS_BUN else 0.20,
+                    help="规则 Bot 环境比例；抢包子默认关闭，保持纯自博弈")
     # ---- 离线蒸馏（--distill-data 提供则先跑蒸馏，再可选接 PPO）----
     ap.add_argument("--distill-data", default=None,
                     help="collect_distill 的 npz（支持 glob）。给定时先跑蒸馏")
@@ -1203,6 +1258,16 @@ def main():
     key = jrandom.PRNGKey(0)
     devs = setup_platform()          # 平台层：精度/设备探测（切 CUDA 只动这里）
     print(f"devices: {device_summary(devs)}", flush=True)
+    if IS_BUN:
+        active_levels = prepare_environment(args.levels)
+        if args.distill_data:
+            raise ValueError("抢包子观测/动作维度独立，不能加载普通模式蒸馏数据")
+        print(f"rule=bun map=806 levels={active_levels} obs={N_OBS_CH} ability={N_BOMB}",
+              flush=True)
+    elif args.levels:
+        from . import levels as level_catalog
+        level_catalog.set_active(args.levels, args.level_weights)
+        print(f"rule=battle levels={args.levels}", flush=True)
 
     n, steps = args.num_envs, args.num_steps
     states = init_batch(key, n)
@@ -1252,12 +1317,14 @@ def main():
         if args.save and args.save_every and it and it % args.save_every == 0:
             mid = f"{os.path.splitext(args.save)[0]}_it{it}.pt"
             save_params(params, mid)
+            save_run_metadata(mid, args)
         print(f"[iter {it}] {dt:.2f}s  sps={sps:,.0f}", flush=True)
     tot = 2 * n * steps * args.iters / (time.time() - t0)
     print(f"FINAL end-to-end sps = {tot:,.0f} "
           f"({2*n*steps*args.iters:,} steps)", flush=True)
     if args.save:
         save_params(params, args.save)
+        save_run_metadata(args.save, args)
 
 
 if __name__ == "__main__":

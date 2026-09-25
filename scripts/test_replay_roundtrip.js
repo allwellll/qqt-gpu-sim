@@ -8,7 +8,7 @@ const Q = require(path.join(__dirname, '..', 'web', 'sim.js'));
 
 const levels = JSON.parse(fs.readFileSync(
   path.join(__dirname, '..', 'web', 'assets', 'maps', 'levels.json'), 'utf8'));
-const cases = ['water01_4.map', 'box01_8.map'];
+const cases = ['water01_4.map', 'box01_8.map', 'bun06_8.map'];
 const MOVE = [Q.MOVE_UP, Q.MOVE_DOWN, Q.MOVE_LEFT, Q.MOVE_RIGHT, Q.MOVE_IDLE];
 
 function equal(a, b) {

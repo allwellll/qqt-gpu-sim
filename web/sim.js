@@ -17,7 +17,7 @@
   'use strict';
 
   // ---------------------------------------------------------------- 常量
-  // 全部地图(含空场景)统一 15×13（QQ堂竞技标准尺寸，241 张原版图）
+  // 全部地图(含空场景)统一 15×13（QQ堂竞技标准尺寸）
   const H = 13, W = 15, N = H * W;
   const PUSH_TIME = 0.3;   // 推箱子: 持续推 ≥0.3s 才动一格
   const BUSH_EID = 6003;   // 野外绿色躲猫猫草丛（可通行、可被爆炸清除）
@@ -25,6 +25,9 @@
   const N_PLAYERS = 2;
   const N_MOVES = 5, N_BOMB = 2;
   const MOVE_UP = 0, MOVE_DOWN = 1, MOVE_LEFT = 2, MOVE_RIGHT = 3, MOVE_IDLE = 4;
+  const ITEM_NONE = 0, ITEM_BANANA = 1, ITEM_SLOW_GLUE = 2;
+  const CRATE_BANANA = 3, CRATE_SLOW_GLUE = 4, CRATE_FAST_SHOE = 5;
+  const MOVE_STATUS_NONE = 0, MOVE_STATUS_SLOW = 1, MOVE_STATUS_SLIDE = 2, MOVE_STATUS_FAST = 3;
   // (dy, dx)，索引与方向编码对齐
   const DIRS = [[-1, 0], [1, 0], [0, -1], [0, 1]];
   const EPS = 1e-4;
@@ -160,8 +163,18 @@
       this.bush = new Uint8Array(N);       // 灌木: 可通行 + 可炸 + 藏人
       this.crate = new Uint8Array(N);
       this.superCrate = new Uint8Array(N);   // 1=超级宝箱(拾取+4档)
-      this.crateType = new Int8Array(N);    // 宝箱种类: -1=随机(问号), 0/1/2=泡/威/速(炸开时定)
+      this.crateType = new Int8Array(N);    // -1=随机，0/1/2=泡/威/速，3/4/5=香蕉/慢慢胶/超级鞋
       this.recycle = new Uint8Array(N);
+      this.fieldItem = new Uint8Array(N);   // 1=香蕉皮，2=慢慢胶
+      this.fieldOwner = new Int8Array(N);
+      this.fieldOwner.fill(-1);
+      this.fieldArmed = new Uint8Array(N);
+      this.heldItem = [ITEM_NONE, ITEM_NONE];
+      this.movementStatus = [MOVE_STATUS_NONE, MOVE_STATUS_NONE];
+      this.movementStatusTicks = [0, 0];
+      this.slideDir = [MOVE_DOWN, MOVE_DOWN];
+      this.lastMoveDir = [MOVE_DOWN, MOVE_DOWN];
+      this.tacticalItemFraction = 0;
       this.graveyard = [];                 // 道具墓地：存储被水泡炸毁以及满属性溢出的道具 { type, isSuper }
       this.airdropTotal = 0;
       this.airdropDropped = 0;
@@ -198,12 +211,27 @@
       this.t = 0;
       this.done = false;
       this.winner = null;        // 0 / 1 / null（平局或未结束）
+      this.maxSteps = CFG.maxSteps;
+      // 抢包子(原生规则3)运行时状态：基地库存、地面散包、玩家携带三者守恒。
+      this.isBun = false;
+      this.bunBases = [];
+      this.bunInitial = [0, 0];
+      this.bunStored = [[0, 0], [0, 0]]; // [基地队伍][包子来源队伍]
+      this.bunLoose = new Uint8Array(N * 2); // [格子 * 2 + 包子来源队伍] -> 数量
+      this.bunCarried = [-1, -1];
+      this.bunScore = [0, 0];
+      this.bunTarget = 1;
+      this.bunRespawn = [0, 0];
+      this.bunRespawnTicks = 10 * CFG.tickHz;
+      this.bunCarrySpeedScale = 0.5;
+      this.bunSpawnPos = [[6.5, 4.5], [6.5, 8.5]];
       this.lastCovered = null;   // 最近一次爆炸覆盖掩码（渲染用）
       this.lastDied = [false, false];
       this.lastReplayCovered = null;
       this.lastReplayTriggered = null;
       this.lastReplayPlaced = [false, false];
       this.spawnCells = null;    // 本局出生点（回收排除用）
+      this.itemsEnabled = true;
       // 属性上限默认 = CFG 上限（open/corridor；关卡模式在 _loadLevel 覆盖）
       this.bombsMax = CFG.growthBombsMax;
       this.blastMax = CFG.growthBlastMax;
@@ -250,7 +278,7 @@
       }
 
       // 位置对称化：约一半对局交换 P0/P1 出生点（消除恒打一侧偏置）
-      if (this.rng() < 0.5) {
+      if (!this.isBun && this.rng() < 0.5) {
         const y0 = this.pos[0], x0 = this.pos[1];
         this.pos[0] = this.pos[2]; this.pos[1] = this.pos[3];
         this.pos[2] = y0; this.pos[3] = x0;
@@ -283,6 +311,15 @@
         superCrate: arr(this.superCrate),
         crateType: arr(this.crateType),
         recycle: arr(this.recycle),
+        fieldItem: arr(this.fieldItem),
+        fieldOwner: arr(this.fieldOwner),
+        fieldArmed: arr(this.fieldArmed),
+        heldItem: this.heldItem.slice(),
+        movementStatus: this.movementStatus.slice(),
+        movementStatusTicks: this.movementStatusTicks.slice(),
+        slideDir: this.slideDir.slice(),
+        lastMoveDir: this.lastMoveDir.slice(),
+        tacticalItemFraction: this.tacticalItemFraction,
         graveyard: this.graveyard.map((x) => ({ type: x.type, isSuper: !!x.isSuper })),
         fuse: arr(this.fuse),
         owner: arr(this.owner),
@@ -300,6 +337,18 @@
         })),
         done: this.done,
         winner: this.winner,
+        isBun: !!this.isBun,
+        bunBases: this.bunBases.map((x) => x.slice()),
+        bunInitial: this.bunInitial.slice(),
+        bunStored: this.bunStored.map((x) => x.slice()),
+        bunLoose: arr(this.bunLoose),
+        bunCarried: this.bunCarried.slice(),
+        bunScore: this.bunScore.slice(),
+        bunTarget: this.bunTarget,
+        bunRespawn: this.bunRespawn.slice(),
+        bunRespawnTicks: this.bunRespawnTicks,
+        bunCarrySpeedScale: this.bunCarrySpeedScale,
+        bunSpawnPos: this.bunSpawnPos.map((x) => x.slice()),
         lastDied: this.lastDied.slice(),
         covered: info && info.covered ? arr(info.covered) : arr(this.lastReplayCovered),
         triggered: info && info.triggered ? arr(info.triggered) : arr(this.lastReplayTriggered),
@@ -346,6 +395,15 @@
       if (frame.blastLinger == null) this.blastLinger.fill(0);
       if (frame.brickLinger == null) this.brickLinger.fill(0);
       if (frame.crateType != null) this.crateType = new Int8Array(frame.crateType);
+      if (frame.fieldItem != null) this.fieldItem = new Uint8Array(frame.fieldItem);
+      if (frame.fieldOwner != null) this.fieldOwner = new Int8Array(frame.fieldOwner);
+      if (frame.fieldArmed != null) this.fieldArmed = new Uint8Array(frame.fieldArmed);
+      this.heldItem = (frame.heldItem || [ITEM_NONE, ITEM_NONE]).slice();
+      this.movementStatus = (frame.movementStatus || [MOVE_STATUS_NONE, MOVE_STATUS_NONE]).slice();
+      this.movementStatusTicks = (frame.movementStatusTicks || [0, 0]).slice();
+      this.slideDir = (frame.slideDir || [MOVE_DOWN, MOVE_DOWN]).slice();
+      this.lastMoveDir = (frame.lastMoveDir || [MOVE_DOWN, MOVE_DOWN]).slice();
+      this.tacticalItemFraction = Number(frame.tacticalItemFraction || 0);
       this.graveyard = (frame.graveyard || []).map((x) => ({ type: x.type, isSuper: !!x.isSuper }));
       this.pushBoxes = (frame.pushBoxes || []).map((b) => ({
         o: b.o, cells: b.cells.slice(), eid: b.eid, dead: !!b.dead,
@@ -353,6 +411,27 @@
       this.t = frame.t;
       this.done = !!frame.done;
       this.winner = frame.winner == null ? null : frame.winner;
+      this.isBun = !!frame.isBun;
+      this.bunBases = (frame.bunBases || []).map((x) => x.slice());
+      this.bunInitial = (frame.bunInitial || [1, 1]).slice();
+      this.bunStored = (frame.bunStored || [[1, 0], [0, 1]]).map((x) => x.slice());
+      if (frame.bunLoose) {
+        this.bunLoose = new Uint8Array(frame.bunLoose);
+      } else if (frame.bunAt) {
+        // 兼容原型阶段录像：bunAt 每格最多保存一个散包。
+        this.bunLoose = new Uint8Array(N * 2);
+        for (let i = 0; i < Math.min(N, frame.bunAt.length); i++) {
+          const team = frame.bunAt[i];
+          if (team === 0 || team === 1) this.bunLoose[i * 2 + team] = 1;
+        }
+      }
+      this.bunCarried = (frame.bunCarried || [-1, -1]).slice();
+      this.bunScore = (frame.bunScore || [0, 0]).slice();
+      this.bunTarget = frame.bunTarget == null ? 1 : frame.bunTarget;
+      this.bunRespawn = (frame.bunRespawn || [0, 0]).slice();
+      this.bunRespawnTicks = frame.bunRespawnTicks || 10 * CFG.tickHz;
+      this.bunCarrySpeedScale = frame.bunCarrySpeedScale || 0.5;
+      this.bunSpawnPos = (frame.bunSpawnPos || [[6.5, 4.5], [6.5, 8.5]]).map((x) => x.slice());
       this.lastDied = (frame.lastDied || frame.died || [false, false]).slice();
       this.lastReplayCovered = frame.covered ? new Uint8Array(frame.covered) : null;
       this.lastReplayTriggered = frame.triggered ? new Uint8Array(frame.triggered) : null;
@@ -362,7 +441,7 @@
       return this;
     }
 
-    // 加载一张新地图关卡（web/assets/maps/levels.json 导出的 241 张之一）：
+    // 加载一张新地图关卡（web/assets/maps/levels.json）：
     //   wall/brick 通行性、出生点随机二选、初始属性按地图配置、炸砖爆率按地图
     //   crate_rate（= 57/W，保证全图砖清完 ≈300% 单人满属性）、空场景中心十字宝箱。
     _loadLevel(level) {
@@ -429,10 +508,22 @@
         this.loSpeed[p] = initS;
       }
       // 出生点：从地图出生点列表里随机挑两个（打乱后取前二，保证不同开局）
-      const sp = level.spawns.map((s) => [s[0], s[1]]);
-      for (let i = sp.length - 1; i > 0; i--) {
-        const j = Math.floor(this.rng() * (i + 1));
-        const t = sp[i]; sp[i] = sp[j]; sp[j] = t;
+      const rawSpawns = level.spawns.map((s) => [s[0], s[1]]);
+      let sp = rawSpawns.slice();
+      if (level.bun || level.native_rule === 3) {
+        const groups = [rawSpawns.slice(0, 4), rawSpawns.slice(4, 8)];
+        for (const g of groups) {
+          for (let i = g.length - 1; i > 0; i--) {
+            const j = Math.floor(this.rng() * (i + 1));
+            const t = g[i]; g[i] = g[j]; g[j] = t;
+          }
+        }
+        sp = [groups[0][0] || rawSpawns[0], groups[1][0] || rawSpawns[1] || rawSpawns[0]];
+      } else {
+        for (let i = sp.length - 1; i > 0; i--) {
+          const j = Math.floor(this.rng() * (i + 1));
+          const t = sp[i]; sp[i] = sp[j]; sp[j] = t;
+        }
       }
       const s0 = sp[0], s1 = sp.length > 1 ? sp[1] : sp[0];
       this.pos[0] = s0[0] + 0.5; this.pos[1] = s0[1] + 0.5;
@@ -446,11 +537,14 @@
           this.wall[idx] = 0;
         }
       }
-      // 炸砖 → 宝箱的爆率（地图配置；空场景无砖，crate_rate=0 不走炸砖路径）
-      this.crateRate = (level.crate_rate != null && level.crate_rate > 0)
+      this.itemsEnabled = level.item_field !== 0 && !level.no_items;
+      // 炸砖 → 宝箱的爆率。非道具场显式禁用，其他旧地图保留原有 0→1 兼容语义。
+      this.crateRate = this.itemsEnabled && level.crate_rate != null && level.crate_rate > 0
         ? level.crate_rate : 1.0;
+      if (!this.itemsEnabled) this.crateRate = 0;
       // 宝箱中超级占比（超级威力/泡泡/速度 整体 = 普通爆率的 10% -> 1/11）
       this.superFraction = level.crate_super_fraction || 0;
+      this.tacticalItemFraction = Math.max(0, Math.min(1, Number(level.tactical_item_fraction || 0)));
       // 属性上限标准化在地图文件里（所有地图威力上限=8, 空场景速上限=2.3, 其他地图=2.25）
       this.bombsMax = level.bombs_max || CFG.growthBombsMax;
       this.blastMax = level.blast_max || CFG.growthBlastMax;
@@ -468,6 +562,219 @@
       }
       // 初始宝箱写入发生在兼容墙生成之后；再次清理可防止地图数据越界覆盖。
       this._clearBlockedCrates();
+      this._initBun(level);
+    }
+
+    _initBun(level) {
+      this.isBun = !!(level && (level.bun || level.native_rule === 3 || level.game_mode === '抢包山(bun)'));
+      if (!this.isBun) return;
+      this.bunBases = (level.bun_bases || [[1, 4], [1, 8]]).map((x) => [x[0], x[1]]);
+      this.bunInitial = [1, 1];
+      this.bunStored = [[1, 0], [0, 1]];
+      this.bunLoose.fill(0);
+      this.bunCarried = [-1, -1];
+      this.bunScore = [0, 0];
+      this.bunTarget = Math.max(1, Number(level.bun_target || 1));
+      this.bunRespawn = [0, 0];
+      this.bunRespawnTicks = Math.max(1, Number(level.bun_respawn_ticks || 10 * CFG.tickHz));
+      this.bunCarrySpeedScale = Math.max(0.1, Math.min(1, Number(level.bun_carry_speed_scale || 0.5)));
+      const groups = level.bun_spawns || [level.spawns.slice(0, 4), level.spawns.slice(4, 8)];
+      const picked = [this.pos.slice(0, 2), this.pos.slice(2, 4)];
+      this.bunSpawnPos = picked.map((p) => [p[0], p[1]]);
+      for (let p = 0; p < 2; p++) {
+        if (groups[p] && groups[p].length === 0) this.bunSpawnPos[p] = [picked[p][0], picked[p][1]];
+      }
+      this.maxSteps = Math.round(Number(level.round_duration_ms || 240000) * CFG.tickHz / 1000);
+    }
+
+    _bunBaseTeam(r, c) {
+      for (let t = 0; t < this.bunBases.length; t++) {
+        const b = this.bunBases[t];
+        // 目标表记录的是 3x3 包子屋的锚点；碰撞仍由元素逐格属性决定，
+        // 这里只判定已进入房屋足迹，不能像旧原型那样把整个区域强行清空。
+        if (r >= b[0] && r < b[0] + 3 && c >= b[1] && c < b[1] + 3) return t;
+      }
+      return -1;
+    }
+
+    _bunBaseTotal(team) {
+      const stored = this.bunStored[team] || [];
+      return stored.reduce((sum, count) => sum + count, 0);
+    }
+
+    _bunRefreshScore(team) {
+      let captured = 0;
+      for (let origin = 0; origin < this.bunInitial.length; origin++) {
+        if (origin !== team) captured += this.bunStored[team][origin] || 0;
+      }
+      this.bunScore[team] = captured;
+      return captured;
+    }
+
+    _bunHasCapturedAll(team) {
+      for (let origin = 0; origin < this.bunInitial.length; origin++) {
+        if (origin === team) continue;
+        if ((this.bunStored[team][origin] || 0) < this.bunInitial[origin]) return false;
+      }
+      return true;
+    }
+
+    _bunDrop(player) {
+      const origin = this.bunCarried[player];
+      if (origin < 0) return;
+      const row = Math.max(0, Math.min(H - 1, Math.floor(this.pos[player * 2])));
+      const column = Math.max(0, Math.min(W - 1, Math.floor(this.pos[player * 2 + 1])));
+      this.bunLoose[(row * W + column) * 2 + origin]++;
+      this.bunCarried[player] = -1;
+    }
+
+    _setMovementStatus(player, status, ticks = 10 * CFG.tickHz) {
+      this.movementStatus[player] = status;
+      this.movementStatusTicks[player] = status === MOVE_STATUS_SLIDE ? 0 : ticks;
+      if (status !== MOVE_STATUS_SLIDE) this.slideDir[player] = this.lastMoveDir[player];
+    }
+
+    _clearMovementStatus(player) {
+      this.movementStatus[player] = MOVE_STATUS_NONE;
+      this.movementStatusTicks[player] = 0;
+    }
+
+    _movementStatusStep() {
+      for (let p = 0; p < 2; p++) {
+        if (this.movementStatus[p] !== MOVE_STATUS_SLOW && this.movementStatus[p] !== MOVE_STATUS_FAST) continue;
+        if (this.movementStatusTicks[p] > 0) this.movementStatusTicks[p]--;
+        if (this.movementStatusTicks[p] <= 0) this._clearMovementStatus(p);
+      }
+    }
+
+    playerMoveDirection(player, requestedMove) {
+      return this.movementStatus[player] === MOVE_STATUS_SLIDE ? this.slideDir[player] : requestedMove;
+    }
+
+    playerMoveScale(player) {
+      let scale = this.isBun && this.bunCarried[player] >= 0 ? this.bunCarrySpeedScale : 1;
+      if (this.movementStatus[player] === MOVE_STATUS_SLOW) scale *= 0.5;
+      else if (this.movementStatus[player] === MOVE_STATUS_FAST) scale *= 1.6;
+      else if (this.movementStatus[player] === MOVE_STATUS_SLIDE) scale *= 1.8;
+      return scale;
+    }
+
+    _rollCrateType() {
+      if (this.tacticalItemFraction > 0 && this.rng() < this.tacticalItemFraction) {
+        return { type: CRATE_BANANA + Math.floor(this.rng() * 3), isSuper: false };
+      }
+      return { type: Math.floor(this.rng() * 3), isSuper: this.rng() < this.superFraction };
+    }
+
+    _collectCrate(player, cell) {
+      const type = this.crateType[cell];
+      if (type === CRATE_BANANA || type === CRATE_SLOW_GLUE) {
+        if (this.heldItem[player] !== ITEM_NONE) return false;
+        this.heldItem[player] = type === CRATE_BANANA ? ITEM_BANANA : ITEM_SLOW_GLUE;
+      } else if (type === CRATE_FAST_SHOE) {
+        this._setMovementStatus(player, MOVE_STATUS_FAST);
+      } else {
+        this._grow(player, this.superCrate[cell] === 1, type >= 0 ? type : null);
+      }
+      this.crate[cell] = 0;
+      this.recycle[cell] = 0;
+      this.superCrate[cell] = 0;
+      this.crateType[cell] = -1;
+      return true;
+    }
+
+    _placeHeldItem(player) {
+      const item = this.heldItem[player];
+      if (item === ITEM_NONE || !this.alive[player]) return false;
+      const [row, column] = this.centerCell(player);
+      const cell = row * W + column;
+      if (this.wall[cell] || this.brick[cell] || this.fuse[cell] > 0 || this.fieldItem[cell]) return false;
+      this.fieldItem[cell] = item;
+      this.fieldOwner[cell] = player;
+      this.fieldArmed[cell] = 0;
+      this.heldItem[player] = ITEM_NONE;
+      return true;
+    }
+
+    _updateFieldItems(actions) {
+      for (let cell = 0; cell < N; cell++) {
+        if (!this.fieldItem[cell]) continue;
+        const owner = this.fieldOwner[cell];
+        if (!this.fieldArmed[cell] && (owner < 0 || !this.alive[owner] || this.centerCell(owner)[0] * W + this.centerCell(owner)[1] !== cell)) {
+          this.fieldArmed[cell] = 1;
+        }
+        if (!this.fieldArmed[cell]) continue;
+        for (let p = 0; p < 2; p++) {
+          if (!this.alive[p]) continue;
+          const [row, column] = this.centerCell(p);
+          if (row * W + column !== cell) continue;
+          if (this.fieldItem[cell] === ITEM_BANANA) {
+            const requested = actions[p] && actions[p][0] != null ? actions[p][0] : MOVE_IDLE;
+            const direction = requested !== MOVE_IDLE ? requested : this.lastMoveDir[p];
+            this.slideDir[p] = direction < MOVE_IDLE ? direction : MOVE_DOWN;
+            this._setMovementStatus(p, MOVE_STATUS_SLIDE, 0);
+          } else {
+            this._setMovementStatus(p, MOVE_STATUS_SLOW);
+          }
+          this.fieldItem[cell] = ITEM_NONE;
+          this.fieldOwner[cell] = -1;
+          this.fieldArmed[cell] = 0;
+          break;
+        }
+      }
+    }
+
+    _bunRespawnStep() {
+      if (!this.isBun) return;
+      for (let p = 0; p < 2; p++) {
+        if (this.alive[p] || this.bunRespawn[p] <= 0) continue;
+        this.bunRespawn[p]--;
+        if (this.bunRespawn[p] > 0) continue;
+        const sp = this.bunSpawnPos[p] || this.bunBases[p] || [6.5, 4.5 + p * 4];
+        this.pos[p * 2] = sp[0]; this.pos[p * 2 + 1] = sp[1];
+        this.hp[p] = this.initialHp || 1;
+        this.alive[p] = true;
+        this.invuln[p] = CFG.invulnTicks;
+        this._clearMovementStatus(p);
+      }
+    }
+
+    _bunUpdate() {
+      if (!this.isBun) return;
+      for (let p = 0; p < 2; p++) {
+        if (!this.alive[p]) continue;
+        const [r, c] = this.centerCell(p);
+        const i = r * W + c;
+        const baseTeam = this._bunBaseTeam(r, c);
+        if (baseTeam === p && this.bunCarried[p] >= 0) {
+          const origin = this.bunCarried[p];
+          this.bunStored[p][origin]++;
+          this.bunCarried[p] = -1;
+          this._bunRefreshScore(p);
+          if (this._bunHasCapturedAll(p)) {
+            this.done = true; this.winner = p;
+          }
+          continue;
+        }
+        if (this.bunCarried[p] >= 0) continue;
+
+        // 散包可被任意一方拾取；优先拿敌方包子，避免同格双包时反复捡回己方。
+        const enemy = 1 - p;
+        for (const origin of [enemy, p]) {
+          const looseIndex = i * 2 + origin;
+          if (this.bunLoose[looseIndex] <= 0) continue;
+          this.bunLoose[looseIndex]--;
+          this.bunCarried[p] = origin;
+          break;
+        }
+        if (this.bunCarried[p] >= 0) continue;
+
+        // BunID=0 只表示仍存放在其原属队伍基地的包子；己方不能拿自己的库存。
+        if (baseTeam >= 0 && baseTeam !== p && this.bunStored[baseTeam][baseTeam] > 0) {
+          this.bunStored[baseTeam][baseTeam]--;
+          this.bunCarried[p] = baseTeam;
+        }
+      }
     }
 
     _crateBlocked(i) {
@@ -532,7 +839,7 @@
     }
 
     // ------------------------------------------------------- 一个 tick
-    // actions: [[move0, bomb0], [move1, bomb1]]
+    // actions: [[move0, bomb0, useItem0, realtimeMove0], [move1, bomb1, useItem1, realtimeMove1]]
     step(actions) {
       const alive0 = [this.alive[0], this.alive[1]];
       const hpBefore = [this.hp[0], this.hp[1]];
@@ -551,7 +858,8 @@
         const [r, c] = this.centerCell(p);
         const i = r * W + c;
         const ok = alive0[p] && actions[p][1] === 1 && this.fuse[i] <= 0 &&
-          !this.brick[i] && this.liveBombs(p) < this.bombsCap[p];
+          !this.brick[i] && (!this.isBun || this.bunCarried[p] < 0) &&
+          this.liveBombs(p) < this.bombsCap[p];
         if (ok) {
           this.fuse[i] = CFG.fuse;
           this.owner[i] = p;
@@ -560,6 +868,9 @@
           this.bombStyle[i] = p === 0 ? this.playerBombStyle : -1;
           placed[p] = true;
         }
+      }
+      for (let p = 0; p < 2; p++) {
+        if (actions[p][2] === 1) this._placeHeldItem(p);
       }
       // Keep event masks with the logical frame for deterministic replay.
       this.lastReplayPlaced = placed.slice();
@@ -574,13 +885,16 @@
         blocked[i] = this.wall[i] || this.brick[i] || this.fuse[i] > 0 ? 1 : 0;
       }
       for (let p = 0; p < 2; p++) {
-        const mv = actions[p][0];
+        const forcedSlide = this.movementStatus[p] === MOVE_STATUS_SLIDE;
+        const mv = this.playerMoveDirection(p, actions[p][0]);
+        if (actions[p][3] === 1) continue;
         if (!alive0[p] || mv === MOVE_IDLE) continue;
+        this.lastMoveDir[p] = mv;
         const y = this.pos[p * 2], x = this.pos[p * 2 + 1];
-        const dist = CFG.stepLen * this.spdG[p];
+        const dist = CFG.stepLen * this.spdG[p] * this.playerMoveScale(p);
         const [dy, dx] = DIRS[mv];
                 // 推箱子: 前缘顶着可推箱 → 累计推动时间(每tick 0.1s), ≥PUSH_TIME 后箱子移一格
-        if (dy !== 0 || dx !== 0) {
+        if (!forcedSlide && (dy !== 0 || dx !== 0)) {
           const pr = dy !== 0 ? (dy > 0 ? Math.floor(y + CFG.radius + EPS * 8) : Math.floor(y - CFG.radius - EPS * 8)) : Math.floor(y);
           const pc = dx !== 0 ? (dx > 0 ? Math.floor(x + CFG.radius + EPS * 8) : Math.floor(x - CFG.radius - EPS * 8)) : Math.floor(x);
           const pi = pr * W + pc;
@@ -619,13 +933,17 @@
           }
         }
         // 中心路径硬约束 + 贪婪转向：模型输出=目标相邻格，直走被挡自动试垂直方向
-        const [ny, nx] = this._steer(y, x, mv, blocked, dist, p);
+        const [ny, nx] = forcedSlide
+          ? this._tryMove(y, x, mv, blocked, dist)
+          : this._steer(y, x, mv, blocked, dist, p);
         this.pos[p * 2] = ny;
         this.pos[p * 2 + 1] = nx;
         // 边界夹紧（防穿出地图）
         this.pos[p * 2] = Math.min(Math.max(this.pos[p * 2], CFG.radius), H - CFG.radius);
         this.pos[p * 2 + 1] = Math.min(Math.max(this.pos[p * 2 + 1], CFG.radius), W - CFG.radius);
+        if (forcedSlide && Math.abs(ny - y) + Math.abs(nx - x) <= 2 * EPS) this._clearMovementStatus(p);
       }
+      this._updateFieldItems(actions);
 
       // 4. 爆炸与连锁（sim/blast.py::resolve_explosions 的标量版）
       const { covered, triggered } = this._resolveExplosions(blocked);
@@ -664,11 +982,16 @@
         if (covered[i] && this.crate[i]) {
           const type = this.crateType[i] >= 0 ? this.crateType[i] : Math.floor(this.rng() * 3);
           const isSuper = this.superCrate[i] === 1;
-          this.graveyard.push({ type, isSuper });
+          if (type <= 2) this.graveyard.push({ type, isSuper });
           this.crate[i] = 0;
           this.superCrate[i] = 0;
           this.recycle[i] = 0;
           this.crateType[i] = -1;
+        }
+        if (covered[i] && this.fieldItem[i]) {
+          this.fieldItem[i] = ITEM_NONE;
+          this.fieldOwner[i] = -1;
+          this.fieldArmed[i] = 0;
         }
       }
 
@@ -679,9 +1002,15 @@
         if (this.invuln[p] > 0) continue;
         if (this._isHitByExplosion(p, covered)) {
           this.hp[p] = Math.max(0, this.hp[p] - 1);
+          if (this.isBun) this.hp[p] = 0;
           if (this.hp[p] === 0) {
             this.alive[p] = false;
             this.lastDied[p] = true;
+            this._clearMovementStatus(p);
+            if (this.isBun) {
+              this._bunDrop(p);
+              this.bunRespawn[p] = this.bunRespawnTicks;
+            }
           }
         }
       }
@@ -714,9 +1043,10 @@
           this.brick[i] = 0;
           // 砖体真正消除、变成可以通行的瞬间才刷出道具（避免 AI 在不可通行墙体上看到道具/道具上墙）
           if (this.rng() < this.crateRate && !this.wall[i]) {
+            const rolled = this._rollCrateType();
             this.crate[i] = 1;
-            this.superCrate[i] = this.rng() < this.superFraction ? 1 : 0;
-            this.crateType[i] = Math.floor(this.rng() * 3);   // 吃到啥在炸开时定
+            this.superCrate[i] = rolled.isSuper ? 1 : 0;
+            this.crateType[i] = rolled.type;
           }
         }
       }
@@ -729,7 +1059,7 @@
       }
 
       // 6.5 掉血属性惩罚 + 宝箱回收（每项扣 clamp(round(25%×当前值), 1, 2) 档）
-      if (CFG.hitAttrPenalty > 0) {
+      if (this.itemsEnabled && CFG.hitAttrPenalty > 0) {
         for (let p = 0; p < 2; p++) {
           const dmg = hpBefore[p] - this.hp[p];
           if (dmg <= 0 || !alive0[p]) continue;
@@ -747,20 +1077,15 @@
 
       // 7. 计步 + 宝箱拾取成长 + 终局
       this.t++;
+      this._movementStatusStep();
+      this._bunUpdate();
+      this._bunRespawnStep();
       for (let p = 0; p < 2; p++) {
         if (!this.alive[p]) continue;
         const [r, c] = this.centerCell(p);
         const i = r * W + c;
         if (!this.crate[i]) continue;
-        this.crate[i] = 0;
-        const isRecycle = this.recycle[i] === 1;
-        const isSuper = this.superCrate[i] === 1;   // 超级宝箱 +4 档
-        const fAttr = this.crateType[i];            // 炸开时定好的种类(-1=随机)
-        this.recycle[i] = 0;
-        this.superCrate[i] = 0;
-        this.crateType[i] = -1;
-        // 爆率已在"炸砖→生箱"时判定过，踩到必升（种类提前定，见 _grow）
-        if (this.rng() < 1.0) this._grow(p, isSuper, fAttr >= 0 ? fAttr : null);
+        this._collectCrate(p, i);
       }
 
       // 7. 飞鸟 30s（300 tick）大循环：非 UI 手动接管模式下沿途各列精准落地墓地道具
@@ -810,10 +1135,17 @@
       }
 
       const nAlive = (this.alive[0] ? 1 : 0) + (this.alive[1] ? 1 : 0);
-      if (nAlive <= 1) {
+      if (this.isBun && this.done) {
+        // _bunUpdate 已经给出收集齐全的即时胜负。
+      } else if (this.isBun && this.t >= this.maxSteps) {
+        const totals = [this._bunBaseTotal(0), this._bunBaseTotal(1)];
+        if (totals[0] === totals[1]) this.winner = null;
+        else this.winner = totals[0] > totals[1] ? 0 : 1;
+        this.done = true;
+      } else if (!this.isBun && nAlive <= 1) {
         this.done = true;
         this.winner = nAlive === 1 ? (this.alive[0] ? 0 : 1) : null;
-      } else if (this.t >= CFG.maxSteps) {
+      } else if (!this.isBun && this.t >= CFG.maxSteps) {
         this.done = true;
         this.winner = this.hp[0] === this.hp[1] ? null : (this.hp[0] > this.hp[1] ? 0 : 1);
       }
@@ -1182,7 +1514,7 @@
         for (let c = 0; c < ow; c++) {
           const fi = r * W + c, oi = r * ow + c;
           o[5 * n + oi] = danger[fi];
-          o[6 * n + oi] = this.t / CFG.maxSteps;
+          o[6 * n + oi] = this.t / this.maxSteps;
         }
       }
       // 无敌标记 + 可用泡/上限（玩家自己的格）
@@ -1244,10 +1576,40 @@
       }
       const danger = this.dangerMap();
       for (let i = 0; i < N; i++) o[5 * N + i] = danger[i];
-      const tv = this.t / CFG.maxSteps;
+      const tv = this.t / this.maxSteps;
       for (let i = 0; i < N; i++) o[6 * N + i] = tv;
       if (C >= 14) {
         for (let i = 0; i < N; i++) o[13 * N + i] = this.pushable[i];
+      }
+      if (this.isBun && C > 14) {
+        const set = (channel, cell, value = 1) => {
+          if (channel < C && cell >= 0 && cell < N) o[channel * N + cell] = value;
+        };
+        for (let team = 0; team < 2; team++) {
+          const base = this.bunBases[team];
+          if (!base) continue;
+          const channel = team === pid ? 14 : 15;
+          for (let row = base[0]; row < base[0] + 3; row++) {
+            for (let column = base[1]; column < base[1] + 3; column++) {
+              if (row >= 0 && row < H && column >= 0 && column < W) set(channel, row * W + column);
+            }
+          }
+        }
+        for (let i = 0; i < N; i++) {
+          set(16, i, this.bunLoose[i * 2 + pid] || 0);
+          set(17, i, this.bunLoose[i * 2 + opp] || 0);
+          const tactical = this.crate[i] > 0 ? this.crateType[i] : -1;
+          if (tactical === CRATE_BANANA || this.fieldItem[i] === ITEM_BANANA) set(20, i);
+          if (tactical === CRATE_SLOW_GLUE || this.fieldItem[i] === ITEM_SLOW_GLUE) set(21, i);
+          if (this.fieldArmed[i] && this.fieldOwner[i] === opp) set(22, i);
+          if (this.fieldArmed[i] && this.fieldOwner[i] === pid) set(23, i);
+        }
+        for (let player = 0; player < 2; player++) {
+          const origin = this.bunCarried[player];
+          if (origin === pid) splat(18, player);
+          else if (origin === opp) splat(19, player);
+        }
+        return o;
       }
       if (C >= 15) {
         // ch14: 飞鸟空投预判列热力图（Airdrop Column Heatmap）
@@ -1289,7 +1651,36 @@
     encodeStateJAX(pid) {
       const opp = 1 - pid;
       const g = new Float64Array(24);
-      g[0] = this.t / CFG.maxSteps;
+      if (this.isBun) {
+        const carried = this.bunCarried;
+        const stored = this.bunStored;
+        g[0] = this.t / this.maxSteps;
+        g[1] = this.hp[pid] / CFG.maxHp;
+        g[2] = this.hp[opp] / CFG.maxHp;
+        g[3] = this.bombsCap[pid] / CFG.growthBombsMax;
+        g[4] = this.blastCap[pid] / CFG.growthBlastMax;
+        g[5] = this.spdG[pid] / CFG.growthSpeedMax;
+        g[6] = this.bombsCap[opp] / CFG.growthBombsMax;
+        g[7] = this.blastCap[opp] / CFG.growthBlastMax;
+        g[8] = this.spdG[opp] / CFG.growthSpeedMax;
+        g[9] = this.alive[pid] ? 1 : 0;
+        g[10] = this.alive[opp] ? 1 : 0;
+        g[11] = this.bunRespawn[pid] / this.bunRespawnTicks;
+        g[12] = this.bunRespawn[opp] / this.bunRespawnTicks;
+        g[13] = carried[pid] >= 0 ? 1 : 0;
+        g[14] = carried[pid] === opp ? 1 : 0;
+        g[15] = carried[opp] >= 0 ? 1 : 0;
+        g[16] = carried[opp] === pid ? 1 : 0;
+        g[17] = stored[pid][pid];
+        g[18] = stored[pid][opp];
+        g[19] = stored[opp][pid];
+        g[20] = stored[opp][opp];
+        g[21] = this.heldItem[pid] === ITEM_BANANA ? 1 : 0;
+        g[22] = this.heldItem[pid] === ITEM_SLOW_GLUE ? 1 : 0;
+        g[23] = this.movementStatus[pid] !== MOVE_STATUS_NONE ? 1 : 0;
+        return g;
+      }
+      g[0] = this.t / this.maxSteps;
       g[1] = this.hp[pid] / CFG.maxHp;
       g[2] = this.hp[opp] / CFG.maxHp;
       g[3] = this.bombsCap[pid] / CFG.growthBombsMax;
@@ -1500,6 +1891,7 @@
     legalMask() {
       const mm = [[1, 1, 1, 1, 1], [1, 1, 1, 1, 1]];
       const bm = [[1, 1], [1, 1]];
+      const am = [[1, 0, 0], [1, 0, 0]];
       const blocked = new Uint8Array(N);
       for (let i = 0; i < N; i++) {
         // 推箱格豁免：mask 把朝可推箱方向标记为合法（模型才会选这个方向去推），
@@ -1511,7 +1903,7 @@
         if (!this.alive[p]) continue;
         const mode = (this.playerModes && this.playerModes[p]) || 'new';
         const y = this.pos[p * 2], x = this.pos[p * 2 + 1];
-        const dist = CFG.stepLen * (this.spdG ? this.spdG[p] : 1.0);
+        const dist = CFG.stepLen * (this.spdG ? this.spdG[p] : 1.0) * this.playerMoveScale(p);
         const r0 = Math.max(0, Math.min(H - 1, Math.floor(y)));
         const c0 = Math.max(0, Math.min(W - 1, Math.floor(x)));
         for (let mv = 0; mv < 4; mv++) {
@@ -1547,10 +1939,13 @@
         const [r, c] = this.centerCell(p);
         const i = r * W + c;
         const can = this.fuse[i] <= 0 && !this.brick[i] &&
+          (!this.isBun || this.bunCarried[p] < 0) &&
           this.liveBombs(p) < this.bombsCap[p];
         bm[p][1] = can ? 1 : 0;
+        am[p][1] = can ? 1 : 0;
+        am[p][2] = this.isBun && this.heldItem[p] > ITEM_NONE ? 1 : 0;
       }
-      return { mm, bm };
+      return { mm, bm, am };
     }
   }
 
@@ -1854,6 +2249,9 @@
       this.embed = this.meta.embed;
       this.patch = this.meta.patch;
       this.depth = this.meta.depth;
+      this.rule = this.meta.rule || 'elimination';
+      this.abilityActions = Number(this.meta.ability_actions || 2);
+      this.isBunModel = this.rule === 'bun' || this.abilityActions === 3;
       const E = this.embed, P = this.patch;
       const gp = Math.ceil(this.obsShape[1] / P), nTok = gp * gp, T17 = nTok + 1;
       this._nTok = nTok; this._T17 = T17;
@@ -1949,7 +2347,7 @@
     }
 
     // obs: Float32Array(C*H*W) 每玩家视角；state: Float64Array(24)
-    // 返回 { move: [5], bomb: [2], value: number }（move/bomb 与 MLP 同签名）
+    // 返回 { move: [5], bomb: [abilityActions], value: number }；bomb 字段为历史协议名。
     forward(obs, state) {
       const t0 = performance.now();
       const out = this._run(1, [obs], [state])[0];
@@ -2128,8 +2526,9 @@
 
       // 4) patch-token 均值池化 → 三头（每玩家）
       const hmw = this.T('head_wm_w'), hmb = this.T('head_wm_b');   // (E, 5)
-      const hbw = this.T('head_wb_w'), hbb = this.T('head_wb_b');   // (E, 2)
+      const hbw = this.T('head_wb_w'), hbb = this.T('head_wb_b');   // (E, abilityActions)
       const hvw = this.T('head_wv_w'), hvb = this.T('head_wv_b');   // (E, 1) or (E, 128)
+      const abilityActions = hbb.length || this.abilityActions;
       const numBins = hvb.length;
       const outs = [];
       for (let p = 0; p < n; p++) {
@@ -2139,14 +2538,14 @@
           for (let t = 0; t < nTok; t++) s += cur[base + t * E + e];
           g[e] = s / nTok;
         }
-        const move = new Float64Array(5), bomb = new Float64Array(2);
+        const move = new Float64Array(5), bomb = new Float64Array(abilityActions);
         for (let j = 0; j < E; j++) {
-          const gj = g[j], j5 = j * 5, j2 = j * 2;
+          const gj = g[j], j5 = j * 5, ja = j * abilityActions;
           for (let o = 0; o < 5; o++) move[o] += gj * hmw[j5 + o];
-          for (let o = 0; o < 2; o++) bomb[o] += gj * hbw[j2 + o];
+          for (let o = 0; o < abilityActions; o++) bomb[o] += gj * hbw[ja + o];
         }
         for (let o = 0; o < 5; o++) move[o] += hmb[o];
-        for (let o = 0; o < 2; o++) bomb[o] += hbb[o];
+        for (let o = 0; o < abilityActions; o++) bomb[o] += hbb[o];
         let value = 0;
         if (numBins === 128) {
           const vLogits = new Float64Array(128);
@@ -2175,6 +2574,19 @@
         outs.push({ move, bomb, value });
       }
       return outs;
+    }
+
+    _abilityMask(sim, masks, pid) {
+      if (this.abilityActions <= 2) return masks.bm[pid];
+      if (masks.am && masks.am[pid]) return masks.am[pid].slice(0, this.abilityActions);
+      const canBomb = masks.bm[pid][1] ? 1 : 0;
+      const canUseItem = sim.alive[pid] && sim.heldItem && sim.heldItem[pid] > ITEM_NONE ? 1 : 0;
+      return [1, canBomb, canUseItem];
+    }
+
+    _decodeAbility(move, ability) {
+      if (this.abilityActions <= 2) return [move, ability];
+      return [move, ability === 1 ? 1 : 0, ability === 2 ? 1 : 0];
     }
 
     _getLaggedInputs(sim, pid) {
@@ -2207,6 +2619,9 @@
       laggedGv[4] = currGv[4]; // self blast
       laggedGv[5] = currGv[5]; // self speed
       laggedGv[9] = currGv[9]; // self alive
+      if (this.isBunModel) {
+        for (const index of [11, 13, 14, 21, 22, 23]) laggedGv[index] = currGv[index];
+      }
 
       return { obs: laggedObs, state: laggedGv };
     }
@@ -2226,20 +2641,20 @@
       if (this._cT[pid] === sim.t && this._cA[pid]) {
         return this._cA[pid];
       }
-      const { mm, bm } = sim.legalMask();
-      this._cA[pid] = this._decide(sim, pid, mm, bm, rng);
+      const masks = sim.legalMask();
+      this._cA[pid] = this._decide(sim, pid, masks, rng);
       this._cT[pid] = sim.t;
       return this._cA[pid];
     }
 
-    _decide(sim, pid, mm, bm, rng) {
+    _decide(sim, pid, masks, rng) {
       const { obs, state } = this._getLaggedInputs(sim, pid);
       const logits = this.forward(obs, state);
       if (!this._lastVal) this._lastVal = [0, 0];
       this._lastVal[pid] = logits.value;
-      const aM = this._sampleMasked(logits.move, mm[pid], rng);
-      const aB = this._sampleMasked(logits.bomb, bm[pid], rng);
-      return [aM, aB];
+      const move = this._sampleMasked(logits.move, masks.mm[pid], rng);
+      const ability = this._sampleMasked(logits.bomb, this._abilityMask(sim, masks, pid), rng);
+      return this._decodeAbility(move, ability);
     }
 
     // 观战双模型：一次批处理前向出双玩家动作（权重只读一遍，比两次单玩家
@@ -2256,15 +2671,17 @@
       if (this._cT[0] === sim.t && this._cT[1] === sim.t && this._cA[0] && this._cA[1]) {
         return [this._cA[0], this._cA[1]];
       }
-      const { mm, bm } = sim.legalMask();
+      const masks = sim.legalMask();
       const in0 = this._getLaggedInputs(sim, 0);
       const in1 = this._getLaggedInputs(sim, 1);
       const [f0, f1] = this.forward2(in0.obs, in0.state, in1.obs, in1.state);
       this._lastVal = [f0.value, f1.value];
-      this._cA[0] = [this._sampleMasked(f0.move, mm[0], rng),
-                    this._sampleMasked(f0.bomb, bm[0], rng)];
-      this._cA[1] = [this._sampleMasked(f1.move, mm[1], rng),
-                    this._sampleMasked(f1.bomb, bm[1], rng)];
+      const move0 = this._sampleMasked(f0.move, masks.mm[0], rng);
+      const move1 = this._sampleMasked(f1.move, masks.mm[1], rng);
+      const ability0 = this._sampleMasked(f0.bomb, this._abilityMask(sim, masks, 0), rng);
+      const ability1 = this._sampleMasked(f1.bomb, this._abilityMask(sim, masks, 1), rng);
+      this._cA[0] = this._decodeAbility(move0, ability0);
+      this._cA[1] = this._decodeAbility(move1, ability1);
       this._cT[0] = sim.t; this._cT[1] = sim.t;
       return [this._cA[0], this._cA[1]];
     }
@@ -2312,9 +2729,11 @@
       if (this.buf && this.tensors && this.tensors.tok_w) {
         return TransformerModel.prototype.forward.call(this, obs, state);
       }
+      const ability = new Float32Array(this.abilityActions);
+      ability[0] = 1;
       return {
         move: new Float32Array([0, 0, 0, 0, 1]),
-        bomb: new Float32Array([1, 0]),
+        bomb: ability,
         value: 0
       };
     }
@@ -2323,9 +2742,13 @@
       if (this.buf && this.tensors && this.tensors.tok_w) {
         return TransformerModel.prototype.forward2.call(this, o0, s0, o1, s1);
       }
+      const idle = () => {
+        const ability = new Float32Array(this.abilityActions);
+        ability[0] = 1;
+        return { move: new Float32Array([0, 0, 0, 0, 1]), bomb: ability, value: 0 };
+      };
       return [
-        { move: new Float32Array([0, 0, 0, 0, 1]), bomb: new Float32Array([1, 0]), value: 0 },
-        { move: new Float32Array([0, 0, 0, 0, 1]), bomb: new Float32Array([1, 0]), value: 0 }
+        idle(), idle()
       ];
     }
 
@@ -2354,15 +2777,15 @@
       }, [2, C, h, w], '双玩家');
       if (!out) return this._fallbackForward2(o0, s0, o1, s1);
       this._inferMs += performance.now() - t0;   // [prof] 推理耗时累计
-      const n5 = 5, n2 = 2;
+      const n5 = 5, na = this.abilityActions;
       const f0 = {
         move: out.move.data.subarray(0, n5),
-        bomb: out.bomb.data.subarray(0, n2),
+        bomb: out.bomb.data.subarray(0, na),
         value: out.value.data[0],
       };
       const f1 = {
         move: out.move.data.subarray(n5, n5 + n5),
-        bomb: out.bomb.data.subarray(n2, n2 + n2),
+        bomb: out.bomb.data.subarray(na, na + na),
         value: out.value.data[1],
       };
       return [f0, f1];
@@ -2380,8 +2803,8 @@
       if (this._cT[pid] === sim.t && this._cA[pid]) {
         return this._cA[pid];
       }
-      const { mm, bm } = sim.legalMask();
-      this._cA[pid] = await this._decide(sim, pid, mm, bm, rng);
+      const masks = sim.legalMask();
+      this._cA[pid] = await this._decide(sim, pid, masks, rng);
       this._cT[pid] = sim.t;
       return this._cA[pid];
     }
@@ -2398,27 +2821,29 @@
       if (this._cT[0] === sim.t && this._cT[1] === sim.t && this._cA[0] && this._cA[1]) {
         return [this._cA[0], this._cA[1]];
       }
-      const { mm, bm } = sim.legalMask();
+      const masks = sim.legalMask();
       const in0 = this._getLaggedInputs(sim, 0);
       const in1 = this._getLaggedInputs(sim, 1);
       const [f0, f1] = await this.forward2(in0.obs, in0.state, in1.obs, in1.state);
       this._lastVal = [f0.value, f1.value];
-      this._cA[0] = [this._sampleMasked(f0.move, mm[0], rng),
-                    this._sampleMasked(f0.bomb, bm[0], rng)];
-      this._cA[1] = [this._sampleMasked(f1.move, mm[1], rng),
-                    this._sampleMasked(f1.bomb, bm[1], rng)];
+      const move0 = this._sampleMasked(f0.move, masks.mm[0], rng);
+      const move1 = this._sampleMasked(f1.move, masks.mm[1], rng);
+      const ability0 = this._sampleMasked(f0.bomb, this._abilityMask(sim, masks, 0), rng);
+      const ability1 = this._sampleMasked(f1.bomb, this._abilityMask(sim, masks, 1), rng);
+      this._cA[0] = this._decodeAbility(move0, ability0);
+      this._cA[1] = this._decodeAbility(move1, ability1);
       this._cT[0] = sim.t; this._cT[1] = sim.t;
       return [this._cA[0], this._cA[1]];
     }
 
-    async _decide(sim, pid, mm, bm, rng) {
+    async _decide(sim, pid, masks, rng) {
       const { obs, state } = this._getLaggedInputs(sim, pid);
       const logits = await this.forward(obs, state);
       if (!this._lastVal) this._lastVal = [0, 0];
       this._lastVal[pid] = logits.value;
-      const aM = this._sampleMasked(logits.move, mm[pid], rng);
-      const aB = this._sampleMasked(logits.bomb, bm[pid], rng);
-      return [aM, aB];
+      const move = this._sampleMasked(logits.move, masks.mm[pid], rng);
+      const ability = this._sampleMasked(logits.bomb, this._abilityMask(sim, masks, pid), rng);
+      return this._decodeAbility(move, ability);
     }
   }
 
@@ -3027,6 +3452,9 @@
   const QQT = {
     H, W, N, N_PLAYERS, N_MOVES, N_BOMB,
     MOVE_UP, MOVE_DOWN, MOVE_LEFT, MOVE_RIGHT, MOVE_IDLE,
+    ITEM_NONE, ITEM_BANANA, ITEM_SLOW_GLUE,
+    CRATE_BANANA, CRATE_SLOW_GLUE, CRATE_FAST_SHOE,
+    MOVE_STATUS_NONE, MOVE_STATUS_SLOW, MOVE_STATUS_SLIDE, MOVE_STATUS_FAST,
     DIRS, EPS, CFG,
     Sim, MLPModel, CNNModel, TransformerModel, ORTTransformerModel,
     HunterAI, TimeAStarAI, NukemanAI,

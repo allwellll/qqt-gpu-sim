@@ -1,6 +1,34 @@
 {
  "models": [
   {
+   "name": "bun06_h200_10b_it1400",
+   "display_name": "🥟 抢包子06 it1400 2.94B步",
+   "arch": "transformer",
+   "obs_shape": [
+    24,
+    13,
+    15
+   ],
+   "embed": 392,
+   "patch": 3,
+   "depth": 4,
+   "n_players": 2,
+   "it": 1400,
+   "global_step": 2936012800,
+   "source": "bun06_h200_10b_it1400.pt",
+   "generated_at": "2026-09-25 00:19 UTC",
+   "rule": "bun",
+   "qqt_map_id": 806,
+   "ability_actions": 3,
+   "ability_encoding": {
+    "0": "none",
+    "1": "bomb",
+    "2": "use_item"
+   },
+   "max_steps": 2400,
+   "move_actions": 5
+  },
+  {
    "name": "ViTModel2_31.9B",
    "display_name": "ViTModel2_31.9B",
    "arch": "transformer",

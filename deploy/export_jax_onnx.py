@@ -10,7 +10,7 @@ transformer 只有 6 种标准算子（MatMul/Add/LayerNorm/Softmax/Reshape/Relu
   obs[N,13,13,15] → pad(0,0,3,1) → reshape/transpose/reshape → tok 线性 + pos
   state[N,24] → state 线性 + pos → 与 patch tokens concat → [N,17,392]
   ×depth block：LN1 → q/k/v → scores/softmax/att → proj 残差 → LN2 → ReLU FFN
-  → Slice 前 16 tokens → ReduceMean → 三头（move[N,5]/bomb[N,2]/value[N]）
+  → Slice patch tokens → ReduceMean → 三头（move[N,5]/bomb[N,A]/value[N]）
 
 用法：
     PYTHONPATH=. .venv/bin/python deploy/export_jax_onnx.py            # 导出 ckpt/ 下全部
@@ -177,7 +177,8 @@ def build_onnx(weights: dict, embed: int, depth: int, patch: int,
         [helper.make_tensor_value_info("obs", TensorProto.FLOAT, ["N", c, 13, 15]),
          helper.make_tensor_value_info("state", TensorProto.FLOAT, ["N", 24])],
         [helper.make_tensor_value_info("move", TensorProto.FLOAT, ["N", 5]),
-         helper.make_tensor_value_info("bomb", TensorProto.FLOAT, ["N", 2]),
+         helper.make_tensor_value_info("bomb", TensorProto.FLOAT,
+                                       ["N", int(weights["head_wb_b"].shape[0])]),
          helper.make_tensor_value_info("value", TensorProto.FLOAT, ["N"])],
         initializer=inits,
     )
@@ -206,10 +207,10 @@ def export_one(path: str, verify: bool, out_dir: str, incremental: bool = False)
         return False
     weights = extract_transformer(params)
     embed = int(weights["tok_w"].shape[1])
-    # 通道数从 tok_w 反推（[patch²·C, embed]；兼容 13 通道旧 ckpt / 14 通道新 ckpt）
+    # 通道数从 tok_w 反推（[patch²·C, embed]；含 Bun 的 24 通道）
     tot = int(weights["tok_w"].shape[0])
     c, patch = next((tot // (p * p), p) for p in (4, 3, 2, 5, 6)
-                    if tot % (p * p) == 0 and 10 <= tot // (p * p) <= 16)
+                    if tot % (p * p) == 0 and 10 <= tot // (p * p) <= 32)
     depth = int(sum(1 for k in weights if k.startswith("b") and k[1].isdigit()
                     and k.endswith("_ln1_g")))
 
@@ -267,9 +268,9 @@ def main():
         from deploy.export_ckpt import EXCLUDED_MODELS
         paths = sorted(os.path.join(args.ckpt_dir, f)
                        for f in os.listdir(args.ckpt_dir)
-                       if (f.startswith("params_") or f.startswith("ViTModel"))
-                       and f.endswith(".pkl")
-                       and f[:-4] not in EXCLUDED_MODELS)
+                       if (f.startswith("params_") or f.startswith("ViTModel") or f.startswith("bun"))
+                       and f.endswith((".pkl", ".pt"))
+                       and os.path.splitext(f)[0] not in EXCLUDED_MODELS)
     if not paths:
         print("没有可导出的 JAX transformer ckpt")
         return 1

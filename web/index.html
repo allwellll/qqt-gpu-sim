@@ -8,7 +8,7 @@
 <meta http-equiv="Expires" content="0">
 <title>QQT 格斗 · 浏览器版</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>💣</text></svg>">
-<link rel="stylesheet" href="style.css?v=20260903-hud-clean">
+<link rel="stylesheet" href="style.css?v=20260925-bun-items-v2">
 </head>
 <body>
 <div id="wrap">
@@ -106,6 +106,7 @@
       <section>
         <h3>📊 状态</h3>
         <div id="status">加载模型中…</div>
+        <div class="meta">方向键/WASD 移动 · 空格放泡 · E 使用香蕉皮或慢慢胶</div>
       </section>
 
       <section>
@@ -124,17 +125,20 @@
     </aside>
   </div>
 
-  <!-- 移动端触屏控制：竖屏时上方正方形画面，下方左摇杆 + 右放泡键 -->
+  <!-- 移动端触屏控制：竖屏时上方正方形画面，下方左摇杆 + 右侧道具/放泡键 -->
   <div id="touch-controls" class="hidden">
     <div id="joystick"><div id="joystick-knob"></div></div>
-    <div id="bomb-btn">💣</div>
+    <div id="touch-actions">
+      <div id="item-btn">🎒</div>
+      <div id="bomb-btn">💣</div>
+    </div>
   </div>
 </div>
 
 <script src="vendor/ort/ort.all.min.js"></script>
 <script src="vendor/gifenc.global.js"></script>
-<script src="sim.js?v=20260922-proprioceptive-v8"></script>
+<script src="sim.js?v=20260925-bun-items-v2"></script>
 <script src="time_astar_ai.js?v=20260922-stage5-v3"></script>
-<script src="main.js?v=20260922-proprioceptive-v8"></script>
+<script src="main.js?v=20260925-bun-items-v2"></script>
 </body>
 </html>

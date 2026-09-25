@@ -418,9 +418,9 @@ def scan_out_dir(out_dir: str = OUT_DIR) -> list[dict]:
         try:
             with open(file_path, "r", encoding="utf-8") as fp:
                 head = fp.read(8192)
-                m = re.search(r'\"meta\"\s*:\s*(\{.*?\})\s*,\s*\"', head, re.DOTALL)
-                if m:
-                    meta = json.loads(m.group(1))
+                marker = re.search(r'\"meta\"\s*:\s*', head)
+                if marker:
+                    meta, _ = json.JSONDecoder().raw_decode(head[marker.end():])
                 else:
                     fp.seek(0)
                     doc = json.load(fp)

@@ -11,7 +11,12 @@ import jax
 import jax.numpy as jnp
 from jax import random
 
-from .jax_env import N_BOMB, N_MOVES
+import os
+
+if os.environ.get("JAXBOMB_RULE", "battle") == "bun":
+    from .bun_env import N_BOMB, N_MOVES
+else:
+    from .jax_env import N_BOMB, N_MOVES
 
 # Historical Iteration-68 reproduction head: categorical HL-Gauss value
 # distribution (128 bins) rather than a single linear scalar.

@@ -13,7 +13,10 @@
 
 (() => {
   const Q = window.QQT;
-  const { Sim, MLPModel, CNNModel, TransformerModel, ORTTransformerModel, CFG, DIRS, EPS, MOVE_IDLE, MOVE_DOWN, MOVE_LEFT, MOVE_RIGHT, MOVE_UP } = Q;
+  const { Sim, MLPModel, CNNModel, TransformerModel, ORTTransformerModel, CFG, DIRS, EPS,
+    MOVE_IDLE, MOVE_DOWN, MOVE_LEFT, MOVE_RIGHT, MOVE_UP,
+    ITEM_BANANA, ITEM_SLOW_GLUE, CRATE_BANANA, CRATE_SLOW_GLUE, CRATE_FAST_SHOE,
+    MOVE_STATUS_SLOW, MOVE_STATUS_SLIDE, MOVE_STATUS_FAST } = Q;
 
   const H = Q.H, W = Q.W, N = Q.N;
   const CELL = 60;                 // 与 play/duel.py 一致：素材原生 40px/格 × 1.5
@@ -77,7 +80,28 @@
            name.includes('比武') || name.includes('夺宝');
   }
 
+  function isBunLevel(l) {
+    return !!(l && (l.bun || l.native_rule === 3 || l.category === '抢包子' || l.mode === '抢包山(bun)'));
+  }
+
+  function isBunModelMeta(meta) {
+    return !!(meta && (meta.rule === 'bun' || Number(meta.ability_actions) === 3));
+  }
+
+  function modelCompatibilityError(meta, level = selectedLevel) {
+    if (!meta || !level) return '';
+    const bunModel = isBunModelMeta(meta);
+    const bunLevel = isBunLevel(level);
+    if (bunModel && !bunLevel) return '抢包子模型只能在抢包子地图运行';
+    if (!bunModel && bunLevel) return '当前地图需要 Bun 专用模型（或规则 AI）';
+    if (bunModel && meta.qqt_map_id != null && Number(meta.qqt_map_id) !== Number(level.qqt_id)) {
+      return `该模型仅适配地图 ${meta.qqt_map_id}`;
+    }
+    return '';
+  }
+
   function defaultLevelHp(l) {
+    if (isBunLevel(l)) return 1;
     return isBiwuOrDuobao(l) ? 5 : 1;
   }
 
@@ -87,6 +111,10 @@
     if (tr < 0 || tr >= H || tc < 0 || tc >= W) return false;
     const bi = tr * W + tc;
     return !(sim.wall[bi] || (sim.brick[bi] && !sim.pushable[bi]) || sim.fuse[bi] > 0);
+  }
+
+  function playerMoveScale(pid) {
+    return sim && typeof sim.playerMoveScale === 'function' ? sim.playerMoveScale(pid) : 1;
   }
 
   function mouseDestination(cell, search = true) {
@@ -108,7 +136,7 @@
     const ty = cell.r + 0.5, tx = cell.c + 0.5;
     const blocked = new Uint8Array(N);
     for (let i = 0; i < N; i++) blocked[i] = sim.wall[i] || sim.brick[i] || sim.fuse[i] > 0 ? 1 : 0;
-    const dist = CFG.stepLen * sim.spdG[0];
+    const dist = CFG.stepLen * sim.spdG[0] * playerMoveScale(0);
     const score = (py, px) => (py - ty) ** 2 + (px - tx) ** 2;
     const before = score(y, x);
     let bestDir = MOVE_IDLE, bestScore = before;
@@ -181,7 +209,7 @@
     const y = sim.pos[0], x = sim.pos[1];
     const blocked = new Uint8Array(N);
     for (let i = 0; i < N; i++) blocked[i] = sim.wall[i] || sim.brick[i] || sim.fuse[i] > 0 ? 1 : 0;
-    const dist = CFG.stepLen * sim.spdG[0];
+    const dist = CFG.stepLen * sim.spdG[0] * playerMoveScale(0);
     const [ny, nx] = sim._steer(y, x, dir, blocked, dist);
     face[0] = dir;
     sim.pos[0] = Math.min(Math.max(ny, CFG.radius), H - CFG.radius);
@@ -200,7 +228,7 @@
   let hoverCell = null;       // {r, c} 或 null
   let hoverDir = -1;          // 0-4 对应上下左右/停留，-1=无
   let mousePush = null;       // 点击可推箱后的短时持续方向输入
-  // 新地图系统: 241 张原版关卡 (levels.json) + 元素属性表 (elements.json)
+  // 新地图系统: 原版关卡目录 (levels.json) + 元素属性表 (elements.json)
   let levels = [], levelById = new Map(), elements = {};
   let selectedLevel = null;         // 黑屏菜单选中的关卡对象
   let customStats = null;           // 选图页覆盖属性：{bombs,blast,speed,bombsMax,blastMax,speedMax}
@@ -302,10 +330,10 @@
       console.warn('视频录制不可用:', e);
     }
   }
-  let replay = null;          // { meta, actions: [[m0,b0,m1,b1], ...], snapshots: [...] }
+  let replay = null;          // { meta, actions: [[m0,b0,item0,m1,b1,item1], ...], snapshots: [...] }
   const face = [MOVE_DOWN, MOVE_DOWN];
   let lastAiMove = [MOVE_IDLE, MOVE_IDLE];
-  const human = { dirStack: [], latch: new Set(), move: MOVE_IDLE, pendingBomb: false };
+  const human = { dirStack: [], latch: new Set(), move: MOVE_IDLE, pendingBomb: false, pendingItem: false };
   let joyBombDown = false;   // 摇杆放泡按钮按住状态(tick 判断锁存清除用)
   let spaceDownSince = 0, joyDownSince = 0;   // 按下时刻: 长按>180ms 才连放, 点按=1颗
   const hunter = new Q.HunterAI();   // 规则 AI（纯进攻寻路），可当敌/我方
@@ -512,7 +540,7 @@
   // 玩家决策来源：'human' | '__hunter__' | 模型名（观战/规则 AI 时用）。
   // 严格同步：模型决策与物理 step 逐帧对齐，确保放炮脉冲与移动方向 100% 准确生效
   async function aiOf(pid) {
-    if (pid === 0 && !elSpectate.checked) return [MOVE_IDLE, human.pendingBomb ? 1 : 0];
+    if (pid === 0 && !elSpectate.checked) return [MOVE_IDLE, human.pendingBomb ? 1 : 0, human.pendingItem ? 1 : 0, 1];
     const sel = pid === 0 ? p0Sel : enemySel;
     if (isRuleAi(sel)) {
       return getRuleAiAction(sim, pid, sel);
@@ -528,6 +556,18 @@
       }
     }
     return [MOVE_IDLE, 0];
+  }
+
+  function withAutoItem(action, pid) {
+    const out = action.slice();
+    if (out.length >= 3) return out;       // Bun 模型显式输出 use_item，不能被规则自动投放覆盖
+    while (out.length < 3) out.push(0);
+    if (!sim.heldItem || !sim.heldItem[pid] || !sim.alive[pid]) return out;
+    const [row, column] = sim.centerCell(pid);
+    const [otherRow, otherColumn] = sim.centerCell(1 - pid);
+    const close = Math.abs(row - otherRow) + Math.abs(column - otherColumn) <= 4;
+    if (close && !sim.fieldItem[row * W + column]) out[2] = 1;
+    return out;
   }
 
   // ------------------------------------------------------------ AI 动作即时执行与推理降频
@@ -673,14 +713,18 @@
   // 加载全部素材（失败降级：缺图用色块，保证可玩）
   async function loadAssets() {
     loadPhase = '正在加载素材';
-    // ---- 新地图系统：241 张原版关卡 + 元素属性表（旧 scenes.json 场景砖块废除）----
+    // ---- 新地图系统：原版关卡 + 元素属性表（旧 scenes.json 场景砖块废除）----
     const [levelsDoc, elementsDoc] = await Promise.all([
       (await fetch('assets/maps/levels.json?v=' + Date.now())).json(),
       (await fetch('assets/maps/elements.json?v=' + Date.now())).json(),
     ]);
     levels = levelsDoc;
     elements = elementsDoc;
-    levelById = new Map(levels.map((l) => [l.id, l]));
+    levelById = new Map();
+    for (const level of levels) {
+      levelById.set(level.id, level);
+      if (level.qqt_id != null) levelById.set(level.qqt_id, level);
+    }
     // 默认选中第一个普通竞技地图（黑屏菜单可改）
     selectedLevel = levels.find((l) => l.category === '普通竞技') || levels[0];
     const elInitHpOnLoad = typeof document !== 'undefined' ? document.getElementById('initial-hp') : null;
@@ -1070,6 +1114,7 @@
   const elJoy = document.getElementById('joystick');
   const elKnob = document.getElementById('joystick-knob');
   const elBombBtn = document.getElementById('bomb-btn');
+  const elItemBtn = document.getElementById('item-btn');
   if (elJoy && elKnob) {
     const JOY_R = 54;    // 摇杆可拖动半径（≈ 底座 128px 的一半）
     const joyRect = () => (elJoy.getBoundingClientRect
@@ -1118,6 +1163,12 @@
     elBombBtn.addEventListener('pointerup', bombUp);
     elBombBtn.addEventListener('pointercancel', bombUp);
   }
+  if (elItemBtn) {
+    elItemBtn.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      human.pendingItem = true;
+    });
+  }
 
   window.addEventListener('keydown', (e) => {
     held.add(e.code);
@@ -1127,6 +1178,10 @@
       if (!running && sim === null) { startGame(); return; }
       human.pendingBomb = true;
       spaceDownSince = performance.now();
+    }
+    if (e.code === 'KeyE') {
+      e.preventDefault();
+      human.pendingItem = true;
     }
     if (e.code === 'KeyR') { startGame(); }
     // ESC → 回首页（黑屏选图菜单）；局内/结算画面都生效
@@ -1177,7 +1232,7 @@
   function probeMoveDist(pid, mv) {
     const y = sim.pos[pid * 2], x = sim.pos[pid * 2 + 1];
     const blocked = blockedGrid();
-    const dist = CFG.stepLen;
+    const dist = CFG.stepLen * playerMoveScale(pid);
     const [dy, dx] = DIRS[mv];
     if (dy !== 0) {
       const ny = Q.resolveAxis(y + dy * dist, dy * dist, x, y, x, blocked, CFG.radius, H, W, true);
@@ -1203,7 +1258,7 @@
     turnSlideTarget = null;
   }
   function autoTurn(pid, move) {
-    const stepLen = CFG.stepLen;
+    const stepLen = CFG.stepLen * playerMoveScale(pid);
     const moved = move >= 4 ? stepLen : probeMoveDist(pid, move);
     // 完全可走(盒子能走满一步) → 正常移动, 取消滑动
     if (move >= 4 || moved >= stepLen * 0.95) { clearTurnSlide(); return move; }
@@ -1281,14 +1336,17 @@
   }
 
   function frameMove(pid, mv, dt) {
+    const forcedSlide = sim.movementStatus && sim.movementStatus[pid] === MOVE_STATUS_SLIDE;
+    mv = sim.playerMoveDirection ? sim.playerMoveDirection(pid, mv) : mv;
     if (mv === MOVE_IDLE || !sim.alive[pid]) return;
-    const dist = CFG.speed * sim.spdG[pid] * Math.min(dt, 0.1);
+    sim.lastMoveDir[pid] = mv;
+    const dist = CFG.speed * sim.spdG[pid] * playerMoveScale(pid) * Math.min(dt, 0.1);
     if (dist <= 0) return;
     const y = sim.pos[pid * 2], x = sim.pos[pid * 2 + 1];
     const [dy, dx] = DIRS[mv];
     // 推箱子(人类60Hz): 前缘顶着可推箱 → 累计推动时间, ≥0.3s 后箱子移一格
     // (与 sim.js step 同逻辑; 先于 blockedGrid 执行, 移走后本帧即可前进)
-    if (sim.pushBoxAt && (dy !== 0 || dx !== 0)) {
+    if (!forcedSlide && sim.pushBoxAt && (dy !== 0 || dx !== 0)) {
       const R = CFG.radius;
       const pr = dy !== 0 ? (dy > 0 ? Math.floor(y + R + EPS * 8) : Math.floor(y - R - EPS * 8)) : Math.floor(y);
       const pc = dx !== 0 ? (dx > 0 ? Math.floor(x + R + EPS * 8) : Math.floor(x - R - EPS * 8)) : Math.floor(x);
@@ -1359,6 +1417,9 @@
     sim.pos[pid * 2 + 1] = nx;
     sim.pos[pid * 2] = Math.min(Math.max(sim.pos[pid * 2], CFG.radius), H - CFG.radius);
     sim.pos[pid * 2 + 1] = Math.min(Math.max(sim.pos[pid * 2 + 1], CFG.radius), W - CFG.radius);
+    if (forcedSlide && Math.abs(ny - y) + Math.abs(nx - x) <= 2 * EPS && sim._clearMovementStatus) {
+      sim._clearMovementStatus(pid);
+    }
   }
 
   // ------------------------------------------------------------ 开局
@@ -1379,6 +1440,19 @@
   function startGame() {
     if (replayExporting) return;   // 视频导出中：换全局 sim 会打断逐帧渲染，忽略 R/重新开局
     if (!res || !selectedLevel) return;      // 素材/地图未就绪由 logicTick 兜底等待
+    const selectedModels = [enemySel];
+    if (elSpectate.checked) selectedModels.push(p0Sel);
+    for (const name of selectedModels) {
+      if (!name || isRuleAi(name)) continue;
+      const loaded = modelCache.get(name);
+      const meta = loaded ? loaded.meta : modelList.find((item) => item.name === name);
+      const error = modelCompatibilityError(meta);
+      if (error) {
+        running = false;
+        elStatus.innerHTML = `模型与地图不兼容：<b>${error}</b>。请重新选择 AI。`;
+        return;
+      }
+    }
     gameSeed = (Math.random() * 0xFFFFFFFF) >>> 0;
     if (timeAStarHunt) timeAStarHunt.reset();
     if (timeAStarRoam) timeAStarRoam.reset();
@@ -1422,7 +1496,8 @@
     prevCovered = new Set();                 // 清空结构覆盖/进入动画状态
     structAnim.clear();
     rng = Q.mulberry32(gameSeed ^ 0x13579BDF);
-    human.dirStack = []; human.latch.clear(); human.move = MOVE_IDLE; human.pendingBomb = false;
+    human.dirStack = []; human.latch.clear(); human.move = MOVE_IDLE;
+    human.pendingBomb = false; human.pendingItem = false;
     resetAiMotorQueues();
     mousePush = null;
     turnInput = -1;
@@ -1443,7 +1518,7 @@
         p0: elSpectate.checked ? p0Sel : 'human',
         p1: enemySel,
         cfg: Object.assign({}, CFG),   // CFG 快照：重放/分析时不依赖当前版本常量
-        levelId: selectedLevel.id,
+        levelId: selectedLevel.qqt_id != null ? selectedLevel.qqt_id : selectedLevel.id,
         oldMode: !!sim.oldMode,
         tickHz: CFG.tickHz,
         replayStateVersion: 2,
@@ -1517,27 +1592,28 @@
   function modelDisplayName(meta) {
     if (!meta) return '未知模型';
     const name = meta.name || '';
+    const decorate = (text) => isBunModelMeta(meta) && !text.startsWith('🥟') ? `🥟 ${text}` : text;
     // 1. 优先查内置权威昵称表（彻底根除 index.json 重构或覆写导致的昵称丢失）
     if (CANONICAL_NICKNAMES[name]) {
-      return CANONICAL_NICKNAMES[name];
+      return decorate(CANONICAL_NICKNAMES[name]);
     }
     // 2. 检查 meta.display_name 是否已有自定义称号
     if (meta.display_name && meta.display_name !== name) {
       if (meta.display_name.includes('宗师') || meta.display_name.includes('反应者') ||
           meta.display_name.includes('🏆') || meta.display_name.includes('👑') ||
           meta.display_name.includes('🔥') || meta.display_name.includes('💎')) {
-        return meta.display_name;
+        return decorate(meta.display_name);
       }
     }
     // 3. 规则推断宗师/进阶模型（防未来新 checkpoint 未预埋条目）
     const mIt = name.match(/params(?:_8h)?_it0*(\d+)/);
     if (mIt) {
       const it = parseInt(mIt[1], 10);
-      if (it >= 500) return `🏆 破局宗师 (it${it})`;
-      if (it >= 300) return `🥈 进阶大师 (it${it})`;
-      return `🥉 进阶模型 (it${it})`;
+      if (it >= 500) return decorate(`🏆 破局宗师 (it${it})`);
+      if (it >= 300) return decorate(`🥈 进阶大师 (it${it})`);
+      return decorate(`🥉 进阶模型 (it${it})`);
     }
-    return meta.display_name || name;
+    return decorate(meta.display_name || name);
   }
 
   function fillAiSelect(sel, includeHunter) {
@@ -1588,7 +1664,7 @@
   }
 
   async function loadModelList() {
-    const resp = await fetch('models/index.json?v=20260922-permanent-names-v7');
+    const resp = await fetch('models/index.json?v=20260925-bun-inference-v1');
     modelList = (await resp.json()).models || [];
     // 按时间倒序排列（最新导出的模型排在最前）
     modelList.sort((a, b) => {
@@ -1690,6 +1766,15 @@
       return;
     }
 
+    const listedMeta = modelList.find((item) => item.name === sel);
+    const listedCompatibilityError = modelCompatibilityError(listedMeta);
+    if (listedCompatibilityError) {
+      modelLoaded = true;
+      elCurModel.textContent = '⚠️ 模型与地图不兼容';
+      elStatus.innerHTML = `<b>${listedCompatibilityError}</b>。请切换地图或选择匹配的模型。`;
+      return;
+    }
+
     isApplyingModel = true;
     if (elApplyModel) elApplyModel.disabled = true;
     if (elCurModel) elCurModel.textContent = `⏳ 正在连接下载 ${sel}…`;
@@ -1707,6 +1792,8 @@
 
     try {
       const m = await ensureModel(sel);
+      const compatibilityError = modelCompatibilityError(m.meta);
+      if (compatibilityError) throw new Error(compatibilityError);
       enemySel = sel;
       modelLoaded = true;
       requestAnimationFrame(updateProgress);
@@ -2001,7 +2088,7 @@
     const oldDanger = dangerCache;
     const oldActiveExplosions = activeExplosions.slice();
     activeExplosions = [];
-    const replayLevel = levels.find((l) => l.id === doc.meta.levelId) ||
+    const replayLevel = levelById.get(doc.meta.levelId) ||
       levels.find((l) => l.source === doc.meta.map);
     if (!replayLevel) throw new Error(`找不到录像地图 ${doc.meta.map}`);
 
@@ -2317,12 +2404,15 @@
       // 仍按住且超过长按阈值(180ms)才**重新武装** → 点按=恰好1颗, 长按=连放
       if (!spectate) {
         human.pendingBomb = false;
+        human.pendingItem = false;
         const heldNow = held.has('Space') || joyBombDown;
         const downSince = held.has('Space') ? spaceDownSince : joyDownSince;
         if (heldNow && performance.now() - downSince > 180) human.pendingBomb = true;
       }
       a1 = await aiOf(1);
     }
+    if (spectate) a0 = withAutoItem(a0, 0);
+    a1 = withAutoItem(a1, 1);
     const actionMs = performance.now() - actionT0;
     // 推理后即刻行动：零控制延迟，彻底消除左右摇摆震荡；AI 反应调速由模型的 inferEvery 降频负责
     // 拾取判定：人类玩家脚下 step 前有宝箱 → step 后没有 = 吃到
@@ -2331,7 +2421,7 @@
     // 录像：记录本 tick 实际喂给 step 的动作 + 每 20 tick 一个状态快照
     const snapshotT0 = performance.now();
     if (replay) {
-      replay.actions.push([a0[0], a0[1], a1[0], a1[1]]);
+      replay.actions.push([a0[0], a0[1], a0[2] || 0, a1[0], a1[1], a1[2] || 0]);
       if (replay.actions.length % 20 === 1) {
         const bombs = [];
         for (let i = 0; i < N; i++) {
@@ -2397,9 +2487,11 @@
     const postT0 = performance.now();
     // 朝向：人类玩家（非观战）的朝向由 60Hz 帧级移动维护，10Hz tick 不覆盖；
     // AI 做出移动决策时才更新朝向；IDLE 静止时保持上一次朝向，绝不闪回朝下。
-    if (spectate && a0[0] !== MOVE_IDLE) face[0] = a0[0];
-    if (a1[0] !== MOVE_IDLE) face[1] = a1[0];
-    lastAiMove = [a0[0], a1[0]];
+    const effectiveA0Move = sim.playerMoveDirection ? sim.playerMoveDirection(0, a0[0]) : a0[0];
+    const effectiveA1Move = sim.playerMoveDirection ? sim.playerMoveDirection(1, a1[0]) : a1[0];
+    if (spectate && effectiveA0Move !== MOVE_IDLE) face[0] = effectiveA0Move;
+    if (effectiveA1Move !== MOVE_IDLE) face[1] = effectiveA1Move;
+    lastAiMove = [effectiveA0Move, effectiveA1Move];
     // 音效（以人类玩家为监听者，只播人类相关事件）
     if (info.placed[0]) playSnd('place');
     if (hadCrate && !sim.crate[hr * W + hc]) playSnd('pickup');
@@ -2488,6 +2580,8 @@
     else { ctx.fillStyle = '#2d2a32'; ctx.fillRect(0, 0, BOARD_PX, BOARD_H); }
     // 地板层（L2）：每格地面贴图铺满格（40×40 或带偏移）
     const lv = sim && sim.level;
+    // 806 使用由 L2 预合成的纯地板背景，动态墙砖与房屋仍走结构渲染。
+    if (lv && lv.bun) return;
     if (!lv || !lv.layers || !lv.layers[2]) return;
     const g = lv.layers[2];
     for (let r = 0; r < H; r++) {
@@ -2572,6 +2666,79 @@
     }
   }
 
+  function drawBunToken(x, y, team, size = 1, count = 1) {
+    const radius = 15 * size;
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.shadowColor = 'rgba(0,0,0,0.35)';
+    ctx.shadowBlur = 4 * size;
+    ctx.shadowOffsetY = 3 * size;
+    ctx.fillStyle = '#f6c745';
+    ctx.beginPath();
+    ctx.ellipse(0, 2 * size, radius, radius * 0.72, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.shadowColor = 'transparent';
+    ctx.fillStyle = '#ffe78a';
+    ctx.beginPath();
+    ctx.ellipse(-4 * size, -3 * size, radius * 0.52, radius * 0.36, -0.25, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = team === 0 ? '#e5484d' : '#3887e8';
+    ctx.lineWidth = Math.max(2, 3 * size);
+    ctx.beginPath();
+    ctx.arc(0, 1 * size, radius * 0.72, 0.15, Math.PI - 0.15);
+    ctx.stroke();
+    if (count > 1) {
+      ctx.fillStyle = team === 0 ? '#e5484d' : '#3887e8';
+      ctx.beginPath();
+      ctx.arc(radius * 0.72, -radius * 0.55, 8 * size, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#fff';
+      ctx.font = `bold ${Math.round(10 * size)}px sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(String(count), radius * 0.72, -radius * 0.55);
+    }
+    ctx.restore();
+  }
+
+  function drawTacticalItem(x, y, type, size = 1) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.scale(size, size);
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    if (type === CRATE_BANANA || type === ITEM_BANANA) {
+      ctx.strokeStyle = '#f3c928';
+      ctx.lineWidth = 8;
+      ctx.beginPath();
+      ctx.arc(-2, -2, 14, 0.15, Math.PI * 0.88);
+      ctx.stroke();
+      ctx.strokeStyle = '#7b5723';
+      ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.moveTo(11, -5); ctx.lineTo(15, -9); ctx.stroke();
+    } else if (type === CRATE_SLOW_GLUE || type === ITEM_SLOW_GLUE) {
+      ctx.fillStyle = 'rgba(142,76,214,0.9)';
+      ctx.beginPath();
+      ctx.ellipse(0, 5, 18, 11, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#f3dcff';
+      ctx.font = 'bold 13px sans-serif';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText('慢', 0, 4);
+    } else {
+      ctx.fillStyle = '#4fd6ff';
+      ctx.strokeStyle = '#e6fbff';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(-15, -9); ctx.lineTo(4, -9); ctx.lineTo(15, 4);
+      ctx.lineTo(8, 12); ctx.lineTo(-14, 12); ctx.closePath();
+      ctx.fill(); ctx.stroke();
+      ctx.strokeStyle = '#fff'; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.moveTo(-10, -2); ctx.lineTo(3, -2); ctx.stroke();
+    }
+    ctx.restore();
+  }
+
   // 渲染一帧：背景+地板 → 危险区 → 画家算法精灵（墙砖/爆炸/泡/宝箱/角色）→ 无敌罩 → 血条 → HUD
   function render(now) {
     if (mapMenuOpen) return;          // 换地图黑屏菜单：保持已清空的画布，不重绘
@@ -2641,6 +2808,7 @@
       const coveredNow = new Set();
       const structList = sim.oldMode
         ? levelStructures(sim.level).concat(PAD_WALLS) : levelStructures(sim.level);
+
       for (const st of structList) {
         const v = st.pad ? st.eid : sim.level.layers[st.layer][st.r * W + st.c];
         if (!v || v < 0) continue;
@@ -2685,6 +2853,42 @@
         }]);
       }
       prevCovered = coveredNow;
+    }
+
+    // 原生规则3：基地库存、死亡散包都进入统一 Z 排序，不再用覆盖整间房的调试色块。
+    if (sim.isBun) {
+      for (let baseTeam = 0; baseTeam < sim.bunBases.length; baseTeam++) {
+        const base = sim.bunBases[baseTeam];
+        for (let origin = 0; origin < 2; origin++) {
+          const count = sim.bunStored[baseTeam][origin] || 0;
+          if (!count) continue;
+          const row = base[0] + 1, column = base[1] + 1;
+          const x = (column + 0.5 + (origin - 0.5) * 0.26) * CELL;
+          const y = (row + 0.62) * CELL;
+          items.push([row * Z_ROW_STRIDE + 15, () => drawBunToken(x, y, origin, 0.82, count)]);
+        }
+      }
+      for (let i = 0; i < N; i++) {
+        const row = (i / W) | 0, column = i % W;
+        for (let origin = 0; origin < 2; origin++) {
+          const count = sim.bunLoose[i * 2 + origin] || 0;
+          if (!count) continue;
+          const x = (column + 0.5 + (origin - 0.5) * 0.24) * CELL;
+          const y = (row + 0.64) * CELL;
+          items.push([row * Z_ROW_STRIDE + 15, () => drawBunToken(x, y, origin, 0.78, count)]);
+        }
+      }
+    }
+
+    if (sim.fieldItem) {
+      for (let i = 0; i < N; i++) {
+        const type = sim.fieldItem[i];
+        if (!type) continue;
+        const row = (i / W) | 0, column = i % W;
+        const x = (column + 0.5) * CELL;
+        const y = (row + 0.68) * CELL;
+        items.push([row * Z_ROW_STRIDE + 16, () => drawTacticalItem(x, y, type, type === ITEM_BANANA ? 1.0 : 0.9)]);
+      }
     }
 
     // 可推箱(运行时位置): 被推走后精灵跟随新格(静态 layers 已被跳过)
@@ -2871,10 +3075,17 @@
       if (isCellCovered(i)) continue;
       const r = (i / W) | 0, c = i % W;
       // 随机宝箱(带?箱子) / 普通(种类定好) / 超级(种类+超级图标)
+      const type = sim.crateType[i];
+      if (type >= CRATE_BANANA) {
+        const x = (c + 0.5) * CELL;
+        const y = (r + 0.56) * CELL + bob * 0.5;
+        items.push([r * Z_ROW_STRIDE + 15, () => drawTacticalItem(x, y, type, 0.9)]);
+        continue;
+      }
       let p;
-      if (sim.crateType[i] < 0) p = boxQ;
-      else if (sim.superCrate[i]) p = res.superIcons[sim.crateType[i]];
-      else p = res.propIcons[sim.crateType[i]];
+      if (type < 0) p = boxQ;
+      else if (sim.superCrate[i]) p = res.superIcons[type];
+      else p = res.propIcons[type];
       // 原图尺寸，格内居中（不拉伸）
       const px = c * CELL + (CELL - p.width) / 2;
       const py = r * CELL + (CELL - p.height) / 2 + bob * 0.5;
@@ -3091,6 +3302,12 @@
         items.push([z - 1, res.shadow, shadowX, shadowY]);
       }
       items.push([z, s, blitX, blitY]);
+      if (sim.isBun && sim.bunCarried[pid] >= 0) {
+        const bunTeam = sim.bunCarried[pid];
+        const bunX = blitX + s.width * 0.5;
+        const bunY = blitY - 10;
+        items.push([z + 1, () => drawBunToken(bunX, bunY, bunTeam, 1.05, 1)]);
+      }
       chars.push({ pid, z, blitX, blitY, s, wudi, wx, wy, hpv: sim.hp[pid], mx: sim.initialHp || CFG.maxHp });
     }
 
@@ -3243,9 +3460,16 @@
       ctx.fillStyle = '#e8e6df';
       ctx.font = '12px sans-serif';
       ctx.fillText(attrStr, bx + nameW + 6, y0 + 12);
+      const heldName = sim.heldItem[p] === ITEM_BANANA ? '香蕉皮' : (sim.heldItem[p] === ITEM_SLOW_GLUE ? '慢慢胶' : '无');
+      const status = sim.movementStatus[p] === MOVE_STATUS_SLOW ? `减速 ${Math.ceil(sim.movementStatusTicks[p] / CFG.tickHz)}s` :
+        (sim.movementStatus[p] === MOVE_STATUS_FAST ? `超级鞋 ${Math.ceil(sim.movementStatusTicks[p] / CFG.tickHz)}s` :
+        (sim.movementStatus[p] === MOVE_STATUS_SLIDE ? '滑行中' : ''));
+      ctx.fillStyle = '#8b93a5';
+      ctx.font = '11px sans-serif';
+      ctx.fillText(`道具 ${heldName}${p === 0 && !elSpectate.checked && sim.heldItem[p] ? '（E 使用）' : ''}${status ? ` · ${status}` : ''}`, bx, y0 + 31);
     }
     // 倒计时（剩余秒，倒着走）
-    const remain = Math.max(0, Math.ceil(CFG.maxSteps / CFG.tickHz - sim.t / CFG.tickHz));
+    const remain = Math.max(0, Math.ceil(sim.maxSteps / CFG.tickHz - sim.t / CFG.tickHz));
     ctx.fillStyle = '#f5a623';
     ctx.font = 'bold 15px monospace';
     ctx.textAlign = 'right';
@@ -3253,7 +3477,10 @@
     ctx.fillStyle = '#8b93a5';
     ctx.font = '12px sans-serif';
     const lvN = sim && sim.level ? `${sim.level.name}${sim.level.mode.includes('空场景') ? '(空场景)' : ''}` : '-';
-    ctx.fillText(`地图：${lvN} · 对局 #${gameSeed % 100000}`,
+    const bunScore = sim.isBun
+      ? ` · 基地 ${sim._bunBaseTotal(0)}:${sim._bunBaseTotal(1)} · 夺包 ${sim.bunScore[0]}:${sim.bunScore[1]}`
+      : '';
+    ctx.fillText(`地图：${lvN}${bunScore} · 对局 #${gameSeed % 100000}`,
                  BOARD_PX - 18, y0 + 30);
 
     // ---- 实时 AI 胜率评估 (仅同步更新网页顶部 Header 胜率条，去除底部冗余胜率条) ----
@@ -3368,11 +3595,13 @@
       const mousePushing = mousePush && now < mousePush.until && sim.alive[0];
       if (mousePush && !mousePushing) mousePush = null;
       human.move = keyMove !== MOVE_IDLE ? keyMove : (mousePushing ? mousePush.dir : MOVE_IDLE);
-      if (human.move !== MOVE_IDLE && sim.alive[0]) {
+      const forcedSlide = sim.movementStatus && sim.movementStatus[0] === MOVE_STATUS_SLIDE;
+      const requestedMove = forcedSlide ? sim.playerMoveDirection(0, human.move) : human.move;
+      if (requestedMove !== MOVE_IDLE && sim.alive[0]) {
         // 只要有人类按键意图，立即更新朝向（即使撞墙被阻挡，也必须正确面朝输入目标方向）
-        face[0] = human.move;
+        face[0] = requestedMove;
         // 顶箱期间禁止玩家自动转向；必须保持同一方向累计推动时间。
-        const eff = mousePushing ? human.move : autoTurn(0, human.move);
+        const eff = forcedSlide ? requestedMove : (mousePushing ? human.move : autoTurn(0, human.move));
         frameMove(0, eff, dt);            // 坐标用转向方向滑移
         if (!mousePushing && turnSlideTarget && eff === turnSlide) {
           // 只截断本帧的侧滑轴，不改另一轴碰撞结果。到达中心线后下一帧
@@ -3515,7 +3744,7 @@
   //      左右分栏：左=树，右=缩略图预览（两级共用同一预览位）。
   function showMapList(cat) { /* 已被树状菜单取代 */ }
   function showWelcome() {
-    const CAT_ORDER = ['空场景', '比武', '功夫', '中国城', '沙漠', '雪地',
+    const CAT_ORDER = ['空场景', '抢包子', '比武', '功夫', '中国城', '沙漠', '雪地',
                        '矿洞', '水面', '野外', '夺宝', '推箱子'];
     const catOf = (l) => l.category === '普通竞技' ? (l.theme || '普通') : l.category;
     const groups = new Map();                  // cat -> [levels]
@@ -3550,7 +3779,7 @@
       `<button id="mm-enter-btn" class="mm-enter" type="button">点击进入</button>` +
       (isTouch()
         ? `<span class="tip">左摇杆移动 · 💣 键放泡</span>`
-        : `<span class="tip">方向键 / WASD 移动 · 空格 放泡</span>`) +
+        : `<span class="tip">方向键 / WASD 移动 · 空格放泡 · E 使用道具</span>`) +
       `<span class="tip">点击分类展开 → 选择地图 → 调整属性 → 点击进入；R 重开</span>`;
     const tree = document.getElementById('mm-tree');
     const prevImg = document.getElementById('mm-prev-img');
@@ -3573,7 +3802,7 @@
     };
 
     const showRandomPreview = () => {
-      showPrev(null, '随机地图', '全 241 张地图随机抽取', RAND_IMG);
+      showPrev(null, '随机地图', `全 ${levels.length} 张地图随机抽取`, RAND_IMG);
       if (!customStats) {
         customStats = {
           hp: 1,

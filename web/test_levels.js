@@ -172,7 +172,7 @@ let allFail = 0;
 for (const lv of levels) {
   try { run(lv, 7, 60); } catch (e) { allFail++; console.log(`❌ 全量 ${lv.source}: ${e.message}`); }
 }
-console.log(`\n代表关卡 ${sel.length - fails}/${sel.length} 通过；全量 241 关 60 tick 失败 ${allFail}`);
+console.log(`\n代表关卡 ${sel.length - fails}/${sel.length} 通过；全量 ${levels.length} 关 60 tick 失败 ${allFail}`);
 
 // ---- 宝箱语义（与 jax_bomb 对照：sim.js:336 炸砖时掷 crate_rate、拾取必升） ----
 // 1) 炸砖爆率统计：p0 首 tick 放泡后全停，40 tick 内引爆。

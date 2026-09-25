@@ -387,7 +387,8 @@
       const own = sim.centerCell(pid);
       const ownIdx = own[0] * W + own[1];
       const nowMs = (sim.t || 0) * 100;
-      const spd = 3.0 * (sim.spdG ? sim.spdG[pid] : 1.0);
+      const moveScale = sim.playerMoveScale ? sim.playerMoveScale(pid) : 1.0;
+      const spd = 3.0 * (sim.spdG ? sim.spdG[pid] : 1.0) * moveScale;
       const blastCap = sim.blastCap ? sim.blastCap[pid] : 2;
       const danger = this.buildDangerMap(sim, nowMs);
       const { mm, bm } = sim.legalMask();

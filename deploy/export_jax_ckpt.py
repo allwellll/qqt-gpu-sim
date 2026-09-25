@@ -248,11 +248,10 @@ def export_one(path: str, verify: bool, out_dir: str | None = None,
     weights = extract_transformer(params)
 
     # obs_shape / 全局步：ckpt 里没存 obs_shape（jax 版不带），从权重推。
-    # tok_w: [patch²·C, embed] → 反推 patch 与通道数（兼容 13 通道旧 ViT
-    # ckpt 与 14 通道新 ckpt——ch13=可推箱，2026-08 起新训练默认）。
+    # tok_w: [patch²·C, embed] → 反推 patch 与通道数（含 Bun 的 24 通道）。
     tot = int(weights["tok_w"].shape[0])
     c, patch = next((tot // (p * p), p) for p in (4, 3, 2, 5, 6)
-                    if tot % (p * p) == 0 and 10 <= tot // (p * p) <= 16)
+                    if tot % (p * p) == 0 and 10 <= tot // (p * p) <= 32)
     h, w = 13, 15
     embed = int(weights["tok_w"].shape[1])
     depth = int(sum(1 for k in weights if k.startswith("b") and k[1].isdigit()
@@ -264,12 +263,11 @@ def export_one(path: str, verify: bool, out_dir: str | None = None,
     _m = re.search(r"_it(\d+)", os.path.basename(path))
     it = int(_m.group(1)) if _m else (int(ck.get("it") or 0)
                                       if isinstance(ck, dict) else 0)
-    steps_per_iter = 2 * 16384 * 256
-    global_step = it * steps_per_iter
-
-    # 伴生 meta.json 查找（当前目录、ckpt/、ckpt_local/）
+    # 伴生 JSON 查找：Bun 训练保存同名 .json；旧训练链路使用 .meta.json。
     stem_base = stem.replace("_ema", "")
+    sidecar = {}
     for meta_cand in [
+        os.path.splitext(path)[0] + ".json",
         path.replace("_ema.pkl", ".meta.json").replace(".pkl", ".meta.json"),
         os.path.join(os.path.dirname(path), stem_base + ".meta.json"),
         os.path.join(PROJ, "ckpt", stem_base + ".meta.json"),
@@ -278,18 +276,23 @@ def export_one(path: str, verify: bool, out_dir: str | None = None,
         if os.path.isfile(meta_cand):
             try:
                 with open(meta_cand) as fp:
-                    s_meta = json.load(fp)
-                    if "global_steps" in s_meta:
-                        global_step = int(s_meta["global_steps"])
-                        break
-                    elif "global_step" in s_meta:
-                        global_step = int(s_meta["global_step"])
-                        break
+                    sidecar = json.load(fp)
+                    break
             except Exception:
                 pass
 
+    steps_per_iter = 2 * (4096 if sidecar.get("rule") == "bun" else 16384) * 256
+    global_step = it * steps_per_iter
+    if "global_steps" in sidecar:
+        global_step = int(sidecar["global_steps"])
+    elif "global_step" in sidecar:
+        global_step = int(sidecar["global_step"])
+
     disp = stem
-    if "hunt" in stem:
+    if sidecar.get("rule") == "bun":
+        g_fmt = f"{global_step / 1e9:.2f}B" if global_step >= 1e9 else f"{global_step / 1e6:.0f}M"
+        disp = f"🥟 抢包子06 it{it} {g_fmt}步"
+    elif "hunt" in stem:
         g_fmt = f"{global_step / 1e9:.2f}B" if global_step >= 1e9 else f"{global_step / 1e6:.0f}M"
         disp = f"{stem} (⚔️动静追猎新训 it{it} {g_fmt}步{' EMA' if '_ema' in stem else ''})"
     elif it == 1100:
@@ -312,6 +315,11 @@ def export_one(path: str, verify: bool, out_dir: str | None = None,
         "source": os.path.basename(path),
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
     }
+    for key in ("rule", "qqt_map_id", "ability_actions", "ability_encoding", "max_steps"):
+        if key in sidecar:
+            meta[key] = sidecar[key]
+    if "move_actions" in sidecar:
+        meta["move_actions"] = sidecar["move_actions"]
 
     if verify:
         import jax
@@ -380,9 +388,9 @@ def main():
         paths = sorted(
             os.path.join(args.ckpt_dir, f)
             for f in os.listdir(args.ckpt_dir)
-                       if (f.startswith("params_") or f.startswith("ViTModel"))
-                       and f.endswith(".pkl")
-                       and f[:-4] not in EXCLUDED_MODELS)
+                       if (f.startswith("params_") or f.startswith("ViTModel") or f.startswith("bun"))
+                       and f.endswith((".pkl", ".pt"))
+                       and os.path.splitext(f)[0] not in EXCLUDED_MODELS)
 
     if not paths:
         print("没有可导出的 JAX transformer ckpt")
@@ -399,11 +407,24 @@ def main():
         from deploy.export_ckpt import scan_out_dir
         metas = scan_out_dir(out_dir)
         if metas:
-            metas.sort(key=lambda m: m.get("global_step") or m.get("it") or 0,
-                       reverse=True)
             index_path = os.path.join(out_dir, "index.json")
+            existing = []
+            if os.path.isfile(index_path):
+                try:
+                    with open(index_path, encoding="utf-8") as fp:
+                        existing = json.load(fp).get("models", [])
+                except Exception:
+                    existing = []
+            if existing:
+                known = {item.get("name") for item in existing}
+                existing.extend(item for item in metas if item.get("name") not in known)
+                metas = existing
+            else:
+                metas.sort(key=lambda m: m.get("global_step") or m.get("it") or 0,
+                           reverse=True)
             with open(index_path, "w") as f:
                 json.dump({"models": metas}, f, ensure_ascii=False, indent=1)
+                f.write("\n")
             print(f"index.json 更新: {len(metas)} 个模型")
     except Exception as e:
         print(f"WARN: index.json 更新失败（{e}）")

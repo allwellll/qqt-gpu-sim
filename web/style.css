@@ -209,16 +209,21 @@ section.meta code { background: #262c39; padding: 1px 4px; border-radius: 4px; }
     margin-left: -28px; margin-top: -28px;
     pointer-events: none;
   }
-  #bomb-btn {
+  #touch-actions { display: flex; align-items: center; gap: 14px; }
+  #bomb-btn, #item-btn {
     width: 96px; height: 96px; border-radius: 50%;
-    background: radial-gradient(circle at 35% 30%, #ff9a56, #e05a2b);
     color: #fff; font-size: 40px; font-weight: 700;
     display: flex; align-items: center; justify-content: center;
     border: 3px solid rgba(255, 255, 255, 0.35);
     box-shadow: 0 6px 16px rgba(0, 0, 0, 0.4);
     touch-action: none; cursor: pointer;
   }
-  #bomb-btn:active { transform: scale(0.92); }
+  #bomb-btn { background: radial-gradient(circle at 35% 30%, #ff9a56, #e05a2b); }
+  #item-btn {
+    width: 72px; height: 72px; font-size: 30px;
+    background: radial-gradient(circle at 35% 30%, #8b7cf6, #5541b8);
+  }
+  #bomb-btn:active, #item-btn:active { transform: scale(0.92); }
 }
 
 

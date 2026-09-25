@@ -1015,7 +1015,7 @@ def _scatter_recycle(key, wall, brick, bush, crate, rec_crate, lost):
 
 
 def step(state: BombState, actions: jnp.ndarray, key, auto_reset: bool = True,
-         return_info: bool = False):
+         return_info: bool = False, move_scale: jnp.ndarray | None = None):
     """actions: (2, 2) int32 = [dir(0-4), bomb(0/1)]，每玩家。
 
     return_info=False：返回 (state, done)（默认，现有调用方不变）。
@@ -1040,6 +1040,8 @@ def step(state: BombState, actions: jnp.ndarray, key, auto_reset: bool = True,
      _debuffs, _items, _gametype, is_open, t, level_id,
      graveyard, airdrop_total, airdrop_dropped) = state
     dirs, bombs = actions[:, 0], actions[:, 1]
+    if move_scale is None:
+        move_scale = jnp.ones((2,), jnp.float32)
     alive0 = alive
 
     # 1. 引信递减
@@ -1121,8 +1123,10 @@ def step(state: BombState, actions: jnp.ndarray, key, auto_reset: bool = True,
     # 3. 移动（blocked = 泡 | 墙 | 砖；位移 × spd_g）—— _steer 贪婪转向：
     #    模型输出=目标相邻格，直走被挡自动试垂直方向（对齐 Web Sim._steer）
     blocked = (fuse > 0) | wall | brick
-    p0 = _steer(pos[0], dirs[0], alive0[0], blocked, spd_g[0], pushable)
-    p1 = _steer(pos[1], dirs[1], alive0[1], blocked, spd_g[1], pushable)
+    p0 = _steer(pos[0], dirs[0], alive0[0], blocked,
+                spd_g[0] * move_scale[0], pushable)
+    p1 = _steer(pos[1], dirs[1], alive0[1], blocked,
+                spd_g[1] * move_scale[1], pushable)
     newpos = jnp.stack([p0, p1])
 
     # 4. 爆炸与连锁（墙挡火不覆盖；brick 挡火但被覆盖）

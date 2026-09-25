@@ -241,7 +241,10 @@ def set_active(path: str, weights: str | dict = "empty=0.05,功夫=0.1,比武=0.
         for (r, c) in lvl.get("initial_crates", []):
             if 0 <= r < h and 0 <= c < w:
                 crate[i, r, c] = True
-    logw = np.log(np.asarray(w_arr, np.float32))
+    weights_np = np.asarray(w_arr, np.float32)
+    logw = np.full_like(weights_np, -np.inf)
+    positive = weights_np > 0
+    logw[positive] = np.log(weights_np[positive])
     is_open = brick.sum(axis=(1, 2)) == 0
     ls = LevelSet(
         jnp.asarray(wall), jnp.asarray(brick), jnp.asarray(bush),
